@@ -339,11 +339,12 @@ systemctl is-active rm-monitor-container-net-bypass.service
 
 1. `monitor` 每秒扫描官方 `schedule.json`。
 2. 正式比赛状态从 `WAITING` 变为 `STARTED` 后，创建 `match_rounds.STARTED`。
-3. `record-dispatcher` 为该场比赛创建 14 路 `record-job`。
-4. 比赛状态离开 `STARTED` 后，录制任务收到停止信号并收尾。
-5. `uploader-dispatcher` 为原始 FLV 创建飞书多维表格记录，只写相对路径；飞书话题内不再回复文档链接或本地路径，也不复制长期目录、不删除 `/mnt/PC801` 源文件。
-6. 赛后执行 `deploy/local/biliup_upload_match.py --zone 南部赛区 --order N --submit`，从 `/mnt/PC801/rm-monitor/records` 上传原始 FLV。
-7. Bilibili 上传成功后，脚本按分 P 写回飞书多维表格视频链接，并在飞书比赛话题里只回复一次总 B 站链接；随后复制到 `/mnt/server_data/rm-monitor/records` 并校验，成功后删除源文件。
+3. `record-dispatcher` 为该场比赛创建 14 路 `record-job`，内部文件名为 `视角.part1.flv`。
+4. 单路直播如果 15 秒没有读到数据，当前分段会收尾；只要输出文件含音/视频流，就保留为有效分段，并自动创建 `part2`、`part3` 继续录。
+5. 比赛状态离开 `STARTED` 后，录制任务收到停止信号并收尾；随后每个视角的全部分段会用 `ffmpeg -c copy` 合并成最终 `视角.flv`。
+6. `uploader-dispatcher` 只处理最终 `视角.flv`，不会把内部 `partN` 分段写入飞书或上传链路；飞书多维表格只写相对路径。
+7. 赛后执行 `deploy/local/biliup_upload_match.py --zone 南部赛区 --order N --submit`，从 `/mnt/PC801/rm-monitor/records` 上传最终原始 FLV。
+8. Bilibili 上传成功后，脚本按分 P 写回飞书多维表格视频链接，并在飞书比赛话题里只回复一次总 B 站链接；随后复制到 `/mnt/server_data/rm-monitor/records` 并校验，成功后删除源文件。
 
 自动生成的飞书多维表格按赛区建表，例如 `RMUC 2026超级对抗赛-南部赛区`。新表字段顺序为：`场次`、`阶段`、`红方`、`蓝方`、`视角`、`文件路径`、`视频链接`；当前关闭飞书视频附件上传，因此不会创建 `录像` 附件列。
 
@@ -356,6 +357,7 @@ systemctl is-active rm-monitor-container-net-bypass.service
 - `record-job` 录制失败会通知 `lark-notifier`，群内 `@所有人`，并写明“请立即提醒席伟杰修复”。
 - 飞书/上传任务失败会群内 `@所有人`。
 - 长期目录复制失败会群内 `@所有人`，并点名或文本提醒席伟杰；源文件不会删除。
+- 自动续录时，前一个分段若可用会记为成功并写 WARN 日志；dashboard 会把 WARN 暴露出来，但最终上传仍等赛后合并文件生成。
 
 降级方案：
 

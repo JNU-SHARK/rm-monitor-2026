@@ -38,6 +38,7 @@ type DispatchLogic struct {
 const dispatchingStaleAfter = 5 * time.Minute
 const tableCacheTTL = 24 * 3600
 const tableLockTTL = 30
+const partRoleMarker = "__part"
 
 type bitableFieldSpec struct {
 	name      string
@@ -90,6 +91,9 @@ func (l *DispatchLogic) createUploadTasks() error {
 	for _, artifact := range artifacts {
 		recordTask := artifact.Edges.RecordTask
 		if recordTask == nil || recordTask.Edges.MatchRound == nil || recordTask.Edges.MatchRound.Edges.Match == nil {
+			continue
+		}
+		if isPartRole(recordTask.Role) {
 			continue
 		}
 		match := recordTask.Edges.MatchRound.Edges.Match
@@ -286,6 +290,15 @@ func fileChecksum(filePath string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func isPartRole(role string) bool {
+	idx := strings.LastIndex(role, partRoleMarker)
+	if idx < 0 {
+		return false
+	}
+	_, err := strconv.Atoi(role[idx+len(partRoleMarker):])
+	return err == nil
 }
 
 func (l *DispatchLogic) deleteLocalArtifacts(baseDir string, archive *ent.MediaArtifact) error {

@@ -436,6 +436,7 @@ def load_artifacts(args: argparse.Namespace, match_id: str, allow_duplicates: bo
         join match_rounds mr on mr.id = rt.match_round_record_tasks
         where mr.match_rounds = '{sql_escape(match_id)}'
           and ma.kind = 'source'
+          and position('__part' in rt.role) = 0
         order by rt.role, ma.created_at;
     """
     rows = psql(args, query)
@@ -467,6 +468,7 @@ def load_bitable_records(args: argparse.Namespace, match_id: str) -> list[Bitabl
         where mr.match_rounds = '{sql_escape(match_id)}'
           and coalesce(ut.bitable_table_id, '') <> ''
           and coalesce(ut.bitable_record_id, '') <> ''
+          and position('__part' in rt.role) = 0
         order by rt.role, ut.created_at;
     """
     rows = psql(args, query)

@@ -127,6 +127,7 @@ def load_artifacts(args: argparse.Namespace) -> list[Artifact]:
         join match_rounds mr on mr.id = rt.match_round_record_tasks
         join matches m on m.id = mr.match_rounds
         where {' and '.join(where)}
+          and position('__part' in rt.role) = 0
         order by rt.role, ma.created_at;
     """
     rows = psql_rows(args, query)

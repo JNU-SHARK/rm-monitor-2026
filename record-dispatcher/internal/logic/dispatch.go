@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -32,6 +33,8 @@ type DispatchLogic struct {
 const dispatchingStaleAfter = 5 * time.Minute
 const manifestLookback = 30 * time.Second
 const matchStatusStarted = "STARTED"
+const partRoleMarker = "__part"
+const mergeSourcePrefix = "merge:"
 
 func NewDispatchLogic(ctx context.Context, svcCtx *svc.ServiceContext) *DispatchLogic {
 	return &DispatchLogic{ctx: ctx, svcCtx: svcCtx, Logger: logx.WithContext(ctx)}
@@ -44,7 +47,16 @@ func (l *DispatchLogic) Tick() error {
 	if err := l.createTasksForStartedRounds(); err != nil {
 		return err
 	}
+	if err := l.createContinuationTasks(); err != nil {
+		return err
+	}
+	if err := l.createMergeTasksForEndedMatches(); err != nil {
+		return err
+	}
 	if err := l.recoverDispatchingTasks(); err != nil {
+		return err
+	}
+	if err := l.dispatchPendingMergeTasks(); err != nil {
 		return err
 	}
 	if err := l.dispatchPendingTasks(); err != nil {
@@ -148,7 +160,7 @@ func (l *DispatchLogic) createTasksForStartedRounds() error {
 			continue
 		}
 		l.Infof("live urls fetched match_id=%s zone=%s order=%d res=%s roles=%d", m.ID, m.Zone, m.Order, conf.Res, len(urls))
-		existingRoles, err := l.recordRolesForMatch(m.ID)
+		existingRoles, err := l.recordBaseRolesForMatch(m.ID)
 		if err != nil {
 			return err
 		}
@@ -157,13 +169,13 @@ func (l *DispatchLogic) createTasksForStartedRounds() error {
 			if existingRoles[role] {
 				continue
 			}
-			output, err := l.outputPath(conf, m, 1, role)
+			output, err := l.partOutputPath(conf, m, role, 1)
 			if err != nil {
 				return err
 			}
 			err = l.svcCtx.DB.RecordTask.Create().
 				SetMatchRoundID(r.ID).
-				SetRole(role).
+				SetRole(partRole(role, 1)).
 				SetSourceURL(url).
 				SetOutputPath(output).
 				SetStatus(recordtask.StatusPENDING).
@@ -177,7 +189,7 @@ func (l *DispatchLogic) createTasksForStartedRounds() error {
 				return errors.Wrap(err, "create record task")
 			}
 			created++
-			l.Infof("record task created match_id=%s zone=%s order=%d role=%s output=%s", m.ID, m.Zone, m.Order, role, output)
+			l.Infof("record task created match_id=%s zone=%s order=%d role=%s part=1 output=%s", m.ID, m.Zone, m.Order, role, output)
 		}
 		if created == 0 && len(existingRoles) > 0 {
 			l.Debugf("record tasks already exist match_id=%s zone=%s order=%d roles=%d", m.ID, m.Zone, m.Order, len(existingRoles))
@@ -186,7 +198,7 @@ func (l *DispatchLogic) createTasksForStartedRounds() error {
 	return nil
 }
 
-func (l *DispatchLogic) recordRolesForMatch(matchID string) (map[string]bool, error) {
+func (l *DispatchLogic) recordBaseRolesForMatch(matchID string) (map[string]bool, error) {
 	tasks, err := l.svcCtx.DB.RecordTask.Query().
 		Where(recordtask.HasMatchRoundWith(matchround.HasMatchWith(match.ID(matchID)))).
 		Limit(200).
@@ -196,9 +208,143 @@ func (l *DispatchLogic) recordRolesForMatch(matchID string) (map[string]bool, er
 	}
 	out := make(map[string]bool, len(tasks))
 	for _, task := range tasks {
-		out[task.Role] = true
+		out[baseRole(task.Role)] = true
 	}
 	return out, nil
+}
+
+func (l *DispatchLogic) createContinuationTasks() error {
+	matches, err := l.svcCtx.DB.Match.Query().
+		Where(match.LatestStatusEQ(matchStatusStarted)).
+		WithRedTeam().
+		WithBlueTeam().
+		WithRounds(func(q *ent.MatchRoundQuery) {
+			q.Order(matchround.ByRoundNo()).
+				WithRecordTasks()
+		}).
+		Limit(50).
+		All(l.ctx)
+	if err != nil {
+		return errors.Wrap(err, "query started matches for continuation")
+	}
+	conf := l.svcCtx.Config.RecordConf.WithDefaults()
+	for _, m := range matches {
+		startedRound := firstStartedRound(m.Edges.Rounds)
+		if startedRound == nil {
+			continue
+		}
+		parts := collectPartState(m.Edges.Rounds)
+		if len(parts) == 0 {
+			continue
+		}
+		urls, err := recording.LiveURLs(l.ctx, l.svcCtx.RestyClient, conf.LiveInfoURL, m.Zone, conf.Res)
+		if err != nil {
+			l.Errorf("live urls for continuation match %s: %v", m.ID, err)
+			continue
+		}
+		for role, state := range parts {
+			if state.active || state.maxPart <= 0 {
+				continue
+			}
+			url := urls[role]
+			if url == "" {
+				l.Errorf("continuation source missing match_id=%s zone=%s order=%d role=%s", m.ID, m.Zone, m.Order, role)
+				continue
+			}
+			nextPart := state.maxPart + 1
+			output, err := l.partOutputPath(conf, m, role, nextPart)
+			if err != nil {
+				return err
+			}
+			err = l.svcCtx.DB.RecordTask.Create().
+				SetMatchRoundID(startedRound.ID).
+				SetRole(partRole(role, nextPart)).
+				SetSourceURL(url).
+				SetOutputPath(output).
+				SetStatus(recordtask.StatusPENDING).
+				OnConflictColumns(recordtask.MatchRoundColumn, recordtask.FieldRole).
+				DoNothing().
+				Exec(l.ctx)
+			if err != nil {
+				if db.IsNoRows(err) {
+					continue
+				}
+				return errors.Wrap(err, "create continuation record task")
+			}
+			l.Warnf("record continuation created match_id=%s zone=%s order=%d role=%s part=%d output=%s", m.ID, m.Zone, m.Order, role, nextPart, output)
+		}
+	}
+	return nil
+}
+
+func (l *DispatchLogic) createMergeTasksForEndedMatches() error {
+	matches, err := l.svcCtx.DB.Match.Query().
+		Where(match.LatestStatusNEQ(matchStatusStarted)).
+		WithRedTeam().
+		WithBlueTeam().
+		WithRounds(func(q *ent.MatchRoundQuery) {
+			q.Order(matchround.ByRoundNo()).
+				WithRecordTasks(func(q *ent.RecordTaskQuery) {
+					q.WithMediaArtifacts()
+				})
+		}).
+		Limit(100).
+		All(l.ctx)
+	if err != nil {
+		return errors.Wrap(err, "query ended matches for merge")
+	}
+	conf := l.svcCtx.Config.RecordConf.WithDefaults()
+	for _, m := range matches {
+		if len(m.Edges.Rounds) == 0 {
+			continue
+		}
+		parts := collectPartState(m.Edges.Rounds)
+		if len(parts) == 0 {
+			continue
+		}
+		existingFinal := collectFinalTasks(m.Edges.Rounds)
+		for role, state := range parts {
+			if state.active || state.availableParts == 0 {
+				continue
+			}
+			output, err := l.outputPath(conf, m, 1, role)
+			if err != nil {
+				return err
+			}
+			if final, ok := existingFinal[role]; ok {
+				if final.Status != recordtask.StatusFAILED {
+					continue
+				}
+				if err := l.svcCtx.DB.RecordTask.UpdateOneID(final.ID).
+					SetSourceURL(mergeSourcePrefix + role).
+					SetOutputPath(output).
+					SetStatus(recordtask.StatusPENDING).
+					ClearErrorMessage().
+					Exec(l.ctx); err != nil {
+					return errors.Wrap(err, "requeue failed merge task")
+				}
+				l.Warnf("record merge task requeued match_id=%s zone=%s order=%d role=%s task_id=%d", m.ID, m.Zone, m.Order, role, final.ID)
+				continue
+			}
+			err = l.svcCtx.DB.RecordTask.Create().
+				SetMatchRoundID(m.Edges.Rounds[0].ID).
+				SetRole(role).
+				SetSourceURL(mergeSourcePrefix+role).
+				SetOutputPath(output).
+				SetStatus(recordtask.StatusPENDING).
+				OnConflictColumns(recordtask.MatchRoundColumn, recordtask.FieldRole).
+				DoNothing().
+				Exec(l.ctx)
+			if err != nil {
+				if db.IsNoRows(err) {
+					continue
+				}
+				return errors.Wrap(err, "create merge task")
+			}
+			l.Infof("record merge task created match_id=%s zone=%s order=%d role=%s parts=%d output=%s", m.ID, m.Zone, m.Order, role, state.availableParts, output)
+		}
+	}
+	return nil
 }
 
 func (l *DispatchLogic) outputPath(conf common.RecordConf, m *ent.Match, roundNo int, role string) (string, error) {
@@ -223,9 +369,17 @@ func (l *DispatchLogic) outputPath(conf common.RecordConf, m *ent.Match, roundNo
 	})
 }
 
+func (l *DispatchLogic) partOutputPath(conf common.RecordConf, m *ent.Match, role string, part int) (string, error) {
+	output, err := l.outputPath(conf, m, 1, role)
+	if err != nil {
+		return "", err
+	}
+	return addPartSuffix(output, part), nil
+}
+
 func (l *DispatchLogic) dispatchPendingTasks() error {
 	tasks, err := l.svcCtx.DB.RecordTask.Query().
-		Where(recordtask.StatusEQ(recordtask.StatusPENDING)).
+		Where(recordtask.StatusEQ(recordtask.StatusPENDING), recordtask.Not(recordtask.SourceURLHasPrefix(mergeSourcePrefix))).
 		Limit(20).
 		All(l.ctx)
 	if err != nil {
@@ -267,6 +421,54 @@ func (l *DispatchLogic) dispatchPendingTasks() error {
 			return errors.Wrap(err, "mark record running")
 		}
 		l.Infof("record task running task_id=%d job=%s", task.ID, jobName)
+		_ = db.Notify(l.ctx, l.svcCtx.Config.PostgresConf.DSN, db.RecordTaskChangedChannel, strconv.Itoa(task.ID))
+	}
+	return nil
+}
+
+func (l *DispatchLogic) dispatchPendingMergeTasks() error {
+	tasks, err := l.svcCtx.DB.RecordTask.Query().
+		Where(recordtask.StatusEQ(recordtask.StatusPENDING), recordtask.SourceURLHasPrefix(mergeSourcePrefix)).
+		Limit(20).
+		All(l.ctx)
+	if err != nil {
+		return errors.Wrap(err, "query pending merge tasks")
+	}
+	for _, task := range tasks {
+		jobName := jobName("record-merge", task.ID)
+		claimed, err := l.svcCtx.DB.RecordTask.Update().
+			Where(recordtask.ID(task.ID), recordtask.StatusEQ(recordtask.StatusPENDING)).
+			SetStatus(recordtask.StatusDISPATCHING).
+			AddAttempts(1).
+			SetK8sJobName(jobName).
+			Save(l.ctx)
+		if err != nil {
+			return errors.Wrap(err, "mark merge dispatching")
+		}
+		if claimed == 0 {
+			continue
+		}
+		l.Infof("record merge dispatching task_id=%d job=%s", task.ID, jobName)
+		if l.svcCtx.K8s != nil {
+			job := kubejob.Build(l.svcCtx.Config.K8sJobConf, kubejob.JobSpec{
+				Name:     jobName,
+				App:      "record-merge-job",
+				Image:    l.svcCtx.Config.K8sJobConf.Image,
+				Args:     []string{"-f", "/etc/rm-monitor/config.yml", "-merge-task", strconv.Itoa(task.ID)},
+				MountPVC: true,
+				CPU:      "500m",
+				Memory:   "512Mi",
+			})
+			if err := l.svcCtx.K8s.CreateJob(l.ctx, l.svcCtx.Config.K8sJobConf.WithDefaults().Namespace, job); err != nil {
+				_ = l.svcCtx.DB.RecordTask.UpdateOneID(task.ID).SetStatus(recordtask.StatusFAILED).SetErrorMessage(err.Error()).Exec(l.ctx)
+				l.Errorf("record merge job create failed task_id=%d job=%s error=%v", task.ID, jobName, err)
+				return err
+			}
+			l.Infof("record merge job created task_id=%d job=%s", task.ID, jobName)
+		}
+		if err := l.svcCtx.DB.RecordTask.UpdateOneID(task.ID).SetStatus(recordtask.StatusRUNNING).SetStartedAt(time.Now()).Exec(l.ctx); err != nil {
+			return errors.Wrap(err, "mark merge running")
+		}
 		_ = db.Notify(l.ctx, l.svcCtx.Config.PostgresConf.DSN, db.RecordTaskChangedChannel, strconv.Itoa(task.ID))
 	}
 	return nil
@@ -316,6 +518,103 @@ func (l *DispatchLogic) dispatchRecentManifestJobs() error {
 		}
 	}
 	return nil
+}
+
+type partState struct {
+	maxPart        int
+	active         bool
+	availableParts int
+}
+
+func collectPartState(rounds []*ent.MatchRound) map[string]partState {
+	out := map[string]partState{}
+	for _, r := range rounds {
+		for _, task := range r.Edges.RecordTasks {
+			base, part, ok := parsePartRole(task.Role)
+			if !ok {
+				continue
+			}
+			state := out[base]
+			if part > state.maxPart {
+				state.maxPart = part
+			}
+			if isActiveRecordStatus(task.Status) {
+				state.active = true
+			}
+			for _, artifact := range task.Edges.MediaArtifacts {
+				if artifact.Kind == "source" && artifact.Status == "AVAILABLE" {
+					state.availableParts++
+					break
+				}
+			}
+			out[base] = state
+		}
+	}
+	return out
+}
+
+func collectFinalTasks(rounds []*ent.MatchRound) map[string]*ent.RecordTask {
+	out := map[string]*ent.RecordTask{}
+	for _, r := range rounds {
+		for _, task := range r.Edges.RecordTasks {
+			if isPartRole(task.Role) {
+				continue
+			}
+			out[task.Role] = task
+		}
+	}
+	return out
+}
+
+func firstStartedRound(rounds []*ent.MatchRound) *ent.MatchRound {
+	for _, r := range rounds {
+		if r.Status == matchround.StatusSTARTED {
+			return r
+		}
+	}
+	return nil
+}
+
+func isActiveRecordStatus(status recordtask.Status) bool {
+	return status == recordtask.StatusPENDING ||
+		status == recordtask.StatusDISPATCHING ||
+		status == recordtask.StatusRUNNING ||
+		status == recordtask.StatusCANCEL_REQUESTED
+}
+
+func partRole(base string, part int) string {
+	return fmt.Sprintf("%s%s%d", base, partRoleMarker, part)
+}
+
+func parsePartRole(role string) (string, int, bool) {
+	idx := strings.LastIndex(role, partRoleMarker)
+	if idx < 0 {
+		return role, 0, false
+	}
+	part, err := strconv.Atoi(role[idx+len(partRoleMarker):])
+	if err != nil || part <= 0 {
+		return role, 0, false
+	}
+	return role[:idx], part, true
+}
+
+func isPartRole(role string) bool {
+	_, _, ok := parsePartRole(role)
+	return ok
+}
+
+func baseRole(role string) string {
+	base, _, ok := parsePartRole(role)
+	if ok {
+		return base
+	}
+	return role
+}
+
+func addPartSuffix(output string, part int) string {
+	ext := path.Ext(output)
+	base := strings.TrimSuffix(output, ext)
+	return fmt.Sprintf("%s.part%d%s", base, part, ext)
 }
 
 func jobName(prefix string, id int) string {
