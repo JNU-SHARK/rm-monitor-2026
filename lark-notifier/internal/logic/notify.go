@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"path"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -312,7 +314,7 @@ func (l *NotifyLogic) replyUploadTask(task *ent.UploadTask) error {
 	if len(match.Edges.LarkMessages) == 0 {
 		return nil
 	}
-	replyContent, err := uploadReplyContent(task)
+	replyContent, err := l.uploadReplyContent(task)
 	if err != nil {
 		return err
 	}
@@ -354,9 +356,10 @@ func (l *NotifyLogic) replyUploadTask(task *ent.UploadTask) error {
 	return nil
 }
 
-func uploadReplyContent(task *ent.UploadTask) (string, error) {
+func (l *NotifyLogic) uploadReplyContent(task *ent.UploadTask) (string, error) {
 	round := task.Edges.RecordTask.Edges.MatchRound
 	title := fmt.Sprintf("Round%d-%s", round.RoundNo, task.Edges.RecordTask.Role)
+	filePath := path.Clean(filepath.ToSlash(task.SourcePath))
 	content := map[string]any{
 		"zh_cn": map[string]any{
 			"title": title,
@@ -364,7 +367,7 @@ func uploadReplyContent(task *ent.UploadTask) (string, error) {
 				{
 					{
 						"tag":  "text",
-						"text": *task.BitableRecordURL,
+						"text": fmt.Sprintf("多维表格：%s\n文件路径：%s", *task.BitableRecordURL, filePath),
 					},
 				},
 			},

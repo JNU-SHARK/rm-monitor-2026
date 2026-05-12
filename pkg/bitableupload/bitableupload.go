@@ -13,6 +13,7 @@ const (
 	FieldType       = "类型"
 	FieldRedTeam    = "红方"
 	FieldBlueTeam   = "蓝方"
+	FieldFilePath   = "文件路径"
 	FieldAttachment = "录像"
 )
 
@@ -57,6 +58,12 @@ func RecordFields(m *ent.Match, role string) map[string]interface{} {
 		FieldRedTeam:  TeamName(m.Edges.RedTeam),
 		FieldBlueTeam: TeamName(m.Edges.BlueTeam),
 	}
+}
+
+func RecordFieldsWithPath(m *ent.Match, role, filePath string) map[string]interface{} {
+	fields := RecordFields(m, role)
+	fields[FieldFilePath] = filePath
+	return fields
 }
 
 func AttachmentValue(fileToken, name string) []map[string]interface{} {

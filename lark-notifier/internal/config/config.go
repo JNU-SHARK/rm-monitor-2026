@@ -11,9 +11,10 @@ type Config struct {
 		BaseDir string
 	}
 	UploadConf struct {
-		Concurrency  int
-		PartRetries  int
-		RetryBackoff int
+		FilePathBaseDir string `json:",optional"`
+		Concurrency     int
+		PartRetries     int
+		RetryBackoff    int
 	}
 	PostgresConf common.PostgresConf
 	RedisConf    common.RedisConf

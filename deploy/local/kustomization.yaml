@@ -1,0 +1,245 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: rm-monitor
+
+resources:
+  - ../../k8s
+  - deps.yaml
+
+patchesStrategicMerge:
+  - config-patches.yaml
+
+images:
+  - name: ghcr.io/scutrobotlab/rm-monitor/monitor
+    newName: rm-monitor/monitor
+    newTag: latest
+  - name: ghcr.io/scutrobotlab/rm-monitor/lark-notifier
+    newName: rm-monitor/lark-notifier
+    newTag: latest
+  - name: ghcr.io/scutrobotlab/rm-monitor/record-dispatcher
+    newName: rm-monitor/record-dispatcher
+    newTag: latest
+  - name: ghcr.io/scutrobotlab/rm-monitor/record-job
+    newName: rm-monitor/record-job
+    newTag: latest
+  - name: ghcr.io/scutrobotlab/rm-monitor/manifest-job
+    newName: rm-monitor/manifest-job
+    newTag: latest
+  - name: ghcr.io/scutrobotlab/rm-monitor/transcode-dispatcher
+    newName: rm-monitor/transcode-dispatcher
+    newTag: latest
+  - name: ghcr.io/scutrobotlab/rm-monitor/transcode-job
+    newName: rm-monitor/transcode-job
+    newTag: latest
+  - name: ghcr.io/scutrobotlab/rm-monitor/uploader-dispatcher
+    newName: rm-monitor/uploader-dispatcher
+    newTag: latest
+  - name: ghcr.io/scutrobotlab/rm-monitor/uploader-job
+    newName: rm-monitor/uploader-job
+    newTag: latest
+
+patches:
+  - target:
+      kind: PersistentVolume
+      name: rm-monitor-records
+    patch: |-
+      - op: replace
+        path: /spec/capacity/storage
+        value: 900Gi
+      - op: replace
+        path: /spec/local/path
+        value: /mnt/PC801/rm-monitor/records
+  - target:
+      kind: PersistentVolumeClaim
+      name: rm-monitor-records
+    patch: |-
+      - op: replace
+        path: /spec/resources/requests/storage
+        value: 900Gi
+  - target:
+      kind: Deployment
+      name: monitor
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: IfNotPresent
+      - op: add
+        path: /spec/template/spec/containers/0/env
+        value:
+          - name: HTTP_PROXY
+            value: http://192.168.16.3:7897
+          - name: HTTPS_PROXY
+            value: http://192.168.16.3:7897
+          - name: ALL_PROXY
+            value: http://192.168.16.3:7897
+          - name: NO_PROXY
+            value: 127.0.0.1,localhost,10.42.0.0/16,10.43.0.0/16,.svc,.cluster.local,kubernetes,kubernetes.default,kubernetes.default.svc,kubernetes.default.svc.cluster.local
+          - name: http_proxy
+            value: http://192.168.16.3:7897
+          - name: https_proxy
+            value: http://192.168.16.3:7897
+          - name: all_proxy
+            value: http://192.168.16.3:7897
+          - name: no_proxy
+            value: 127.0.0.1,localhost,10.42.0.0/16,10.43.0.0/16,.svc,.cluster.local,kubernetes,kubernetes.default,kubernetes.default.svc,kubernetes.default.svc.cluster.local
+  - target:
+      kind: Deployment
+      name: lark-notifier
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 1
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: IfNotPresent
+      - op: add
+        path: /spec/template/spec/containers/0/env
+        value:
+          - name: HTTP_PROXY
+            value: http://192.168.16.3:7897
+          - name: HTTPS_PROXY
+            value: http://192.168.16.3:7897
+          - name: ALL_PROXY
+            value: http://192.168.16.3:7897
+          - name: NO_PROXY
+            value: 127.0.0.1,localhost,10.42.0.0/16,10.43.0.0/16,.svc,.cluster.local,kubernetes,kubernetes.default,kubernetes.default.svc,kubernetes.default.svc.cluster.local
+          - name: http_proxy
+            value: http://192.168.16.3:7897
+          - name: https_proxy
+            value: http://192.168.16.3:7897
+          - name: all_proxy
+            value: http://192.168.16.3:7897
+          - name: no_proxy
+            value: 127.0.0.1,localhost,10.42.0.0/16,10.43.0.0/16,.svc,.cluster.local,kubernetes,kubernetes.default,kubernetes.default.svc,kubernetes.default.svc.cluster.local
+          - name: RM_MONITOR_LARK_APP_ID
+            valueFrom:
+              secretKeyRef:
+                name: rm-monitor-lark
+                key: app-id
+                optional: true
+          - name: RM_MONITOR_LARK_APP_SECRET
+            valueFrom:
+              secretKeyRef:
+                name: rm-monitor-lark
+                key: app-secret
+                optional: true
+  - target:
+      kind: Deployment
+      name: record-dispatcher
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: IfNotPresent
+      - op: add
+        path: /spec/template/spec/containers/0/env
+        value:
+          - name: HTTP_PROXY
+            value: http://192.168.16.3:7897
+          - name: HTTPS_PROXY
+            value: http://192.168.16.3:7897
+          - name: ALL_PROXY
+            value: http://192.168.16.3:7897
+          - name: NO_PROXY
+            value: 127.0.0.1,localhost,10.42.0.0/16,10.43.0.0/16,.svc,.cluster.local,kubernetes,kubernetes.default,kubernetes.default.svc,kubernetes.default.svc.cluster.local
+          - name: http_proxy
+            value: http://192.168.16.3:7897
+          - name: https_proxy
+            value: http://192.168.16.3:7897
+          - name: all_proxy
+            value: http://192.168.16.3:7897
+          - name: no_proxy
+            value: 127.0.0.1,localhost,10.42.0.0/16,10.43.0.0/16,.svc,.cluster.local,kubernetes,kubernetes.default,kubernetes.default.svc,kubernetes.default.svc.cluster.local
+  - target:
+      kind: Deployment
+      name: transcode-dispatcher
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: IfNotPresent
+      - op: add
+        path: /spec/template/spec/containers/0/env
+        value:
+          - name: HTTP_PROXY
+            value: http://192.168.16.3:7897
+          - name: HTTPS_PROXY
+            value: http://192.168.16.3:7897
+          - name: ALL_PROXY
+            value: http://192.168.16.3:7897
+          - name: NO_PROXY
+            value: 127.0.0.1,localhost,10.42.0.0/16,10.43.0.0/16,.svc,.cluster.local,kubernetes,kubernetes.default,kubernetes.default.svc,kubernetes.default.svc.cluster.local
+          - name: http_proxy
+            value: http://192.168.16.3:7897
+          - name: https_proxy
+            value: http://192.168.16.3:7897
+          - name: all_proxy
+            value: http://192.168.16.3:7897
+          - name: no_proxy
+            value: 127.0.0.1,localhost,10.42.0.0/16,10.43.0.0/16,.svc,.cluster.local,kubernetes,kubernetes.default,kubernetes.default.svc,kubernetes.default.svc.cluster.local
+  - target:
+      kind: Deployment
+      name: uploader-dispatcher
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: IfNotPresent
+      - op: add
+        path: /spec/template/spec/containers/0/volumeMounts/-
+        value:
+          name: records
+          mountPath: /records
+      - op: add
+        path: /spec/template/spec/containers/0/volumeMounts/-
+        value:
+          name: server-data
+          mountPath: /server-data
+      - op: add
+        path: /spec/template/spec/volumes/-
+        value:
+          name: records
+          persistentVolumeClaim:
+            claimName: rm-monitor-records
+      - op: add
+        path: /spec/template/spec/volumes/-
+        value:
+          name: server-data
+          hostPath:
+            path: /mnt/server_data/rm-monitor/records
+            type: DirectoryOrCreate
+      - op: add
+        path: /spec/template/spec/containers/0/env
+        value:
+          - name: HTTP_PROXY
+            value: http://192.168.16.3:7897
+          - name: HTTPS_PROXY
+            value: http://192.168.16.3:7897
+          - name: ALL_PROXY
+            value: http://192.168.16.3:7897
+          - name: NO_PROXY
+            value: 127.0.0.1,localhost,10.42.0.0/16,10.43.0.0/16,.svc,.cluster.local,kubernetes,kubernetes.default,kubernetes.default.svc,kubernetes.default.svc.cluster.local
+          - name: http_proxy
+            value: http://192.168.16.3:7897
+          - name: https_proxy
+            value: http://192.168.16.3:7897
+          - name: all_proxy
+            value: http://192.168.16.3:7897
+          - name: no_proxy
+            value: 127.0.0.1,localhost,10.42.0.0/16,10.43.0.0/16,.svc,.cluster.local,kubernetes,kubernetes.default,kubernetes.default.svc,kubernetes.default.svc.cluster.local
+          - name: RM_MONITOR_LARK_APP_ID
+            valueFrom:
+              secretKeyRef:
+                name: rm-monitor-lark
+                key: app-id
+                optional: true
+          - name: RM_MONITOR_LARK_APP_SECRET
+            valueFrom:
+              secretKeyRef:
+                name: rm-monitor-lark
+                key: app-secret
+                optional: true
+          - name: RM_MONITOR_BITABLE_APP_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: rm-monitor-lark
+                key: bitable-app-token
+                optional: true

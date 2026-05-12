@@ -2,6 +2,7 @@ package kubejob
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 
 	"github.com/pkg/errors"
@@ -87,12 +88,39 @@ type JobSpec struct {
 	MemLimit string
 }
 
+var inheritedEnvKeys = []string{
+	"HTTP_PROXY",
+	"HTTPS_PROXY",
+	"ALL_PROXY",
+	"NO_PROXY",
+	"http_proxy",
+	"https_proxy",
+	"all_proxy",
+	"no_proxy",
+	"RM_MONITOR_LARK_APP_ID",
+	"RM_MONITOR_LARK_APP_SECRET",
+	"RM_MONITOR_BITABLE_APP_TOKEN",
+	"RM_MONITOR_FEISHU_APP_ID",
+	"RM_MONITOR_FEISHU_APP_SECRET",
+	"RM_MONITOR_FEISHU_BITABLE_APP_TOKEN",
+}
+
 func Build(conf config.K8sJobConf, spec JobSpec) *batchv1.Job {
 	conf = conf.WithDefaults()
 	labels := map[string]string{"app.kubernetes.io/name": spec.App, "rm-monitor/job": spec.App}
-	env := make([]corev1.EnvVar, 0, len(spec.Env))
+	env := make([]corev1.EnvVar, 0, len(spec.Env)+len(inheritedEnvKeys))
+	envNames := make(map[string]struct{}, len(spec.Env)+len(inheritedEnvKeys))
 	for k, v := range spec.Env {
 		env = append(env, corev1.EnvVar{Name: k, Value: v})
+		envNames[k] = struct{}{}
+	}
+	for _, key := range inheritedEnvKeys {
+		if _, ok := envNames[key]; ok {
+			continue
+		}
+		if value := os.Getenv(key); value != "" {
+			env = append(env, corev1.EnvVar{Name: key, Value: value})
+		}
 	}
 	container := corev1.Container{
 		Name:            spec.App,

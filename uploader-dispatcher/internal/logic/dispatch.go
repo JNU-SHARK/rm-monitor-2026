@@ -2,20 +2,30 @@ package logic
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
+	"os"
+	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	larkbitable "github.com/larksuite/oapi-sdk-go/v3/service/bitable/v1"
+	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 	"github.com/pkg/errors"
 	"scutbot.cn/web/rm-monitor/ent"
 	"scutbot.cn/web/rm-monitor/ent/mediaartifact"
 	"scutbot.cn/web/rm-monitor/ent/uploadtask"
 	"scutbot.cn/web/rm-monitor/pkg/bitableupload"
+	common "scutbot.cn/web/rm-monitor/pkg/config"
 	"scutbot.cn/web/rm-monitor/pkg/db"
 	"scutbot.cn/web/rm-monitor/pkg/kubejob"
 	"scutbot.cn/web/rm-monitor/pkg/logx"
+	"scutbot.cn/web/rm-monitor/pkg/storagepath"
 	"scutbot.cn/web/rm-monitor/uploader-dispatcher/internal/svc"
 )
 
@@ -50,12 +60,13 @@ func (l *DispatchLogic) createUploadTasks() error {
 	}
 	artifacts, err := l.svcCtx.DB.MediaArtifact.Query().
 		Where(
-			mediaartifact.KindEQ(mediaartifact.KindSource),
+			mediaartifact.KindEQ(mediaartifact.KindArchive),
 			mediaartifact.StatusEQ(mediaartifact.StatusAVAILABLE),
 			mediaartifact.HasRecordTask(),
 			mediaartifact.Not(mediaartifact.HasUploadTask()),
 		).
 		WithRecordTask(func(q *ent.RecordTaskQuery) {
+			q.WithMediaArtifacts()
 			q.WithMatchRound(func(q *ent.MatchRoundQuery) {
 				q.WithMatch(func(q *ent.MatchQuery) {
 					q.WithRedTeam().WithBlueTeam()
@@ -65,7 +76,7 @@ func (l *DispatchLogic) createUploadTasks() error {
 		Limit(100).
 		All(l.ctx)
 	if err != nil {
-		return errors.Wrap(err, "query source artifacts")
+		return errors.Wrap(err, "query archive artifacts")
 	}
 	for _, artifact := range artifacts {
 		recordTask := artifact.Edges.RecordTask
@@ -73,41 +84,223 @@ func (l *DispatchLogic) createUploadTasks() error {
 			continue
 		}
 		match := recordTask.Edges.MatchRound.Edges.Match
-		tableID, err := l.ensureTable(conf.BitableAppToken, bitableupload.TableName(match.Event, match.Zone))
+		tableID, err := l.ensureTable(conf.BitableAppToken, bitableupload.TableName(match.Event, match.Zone), !conf.DisableFileUpload)
 		if err != nil {
 			return err
 		}
-		recordID, recordURL, err := l.createBitableRecord(conf.BitableAppToken, tableID, artifact.ID, match, recordTask.Role)
+		relativePath, err := relativeArtifactPath(artifact.Path)
 		if err != nil {
 			return err
 		}
-		if err := l.svcCtx.DB.UploadTask.Create().
+		recordID, recordURL, err := l.createBitableRecord(conf.BitableAppToken, tableID, artifact.ID, match, recordTask.Role, relativePath)
+		if err != nil {
+			return err
+		}
+		copyErr := l.archiveLongTermCopy(conf, artifact, relativePath)
+		needsLocalDelete := copyErr == nil && conf.DisableFileUpload && conf.LongTermBaseDir != "" && conf.DeleteLocalAfterCopy
+		create := l.svcCtx.DB.UploadTask.Create().
 			SetRecordTaskID(recordTask.ID).
 			SetSourceArtifactID(artifact.ID).
 			SetSourcePath(artifact.Path).
 			SetBitableAppToken(conf.BitableAppToken).
 			SetBitableTableID(tableID).
 			SetBitableRecordID(recordID).
-			SetNillableBitableRecordURL(recordURL).
-			SetStatus(uploadtask.StatusPENDING).
+			SetNillableBitableRecordURL(recordURL)
+		switch {
+		case copyErr != nil:
+			create.SetStatus(uploadtask.StatusFAILED).SetErrorMessage(copyErr.Error())
+		case needsLocalDelete:
+			create.SetStatus(uploadtask.StatusRUNNING)
+		case conf.DisableFileUpload:
+			create.SetStatus(uploadtask.StatusSUCCEEDED).SetCompletedAt(time.Now())
+		default:
+			create.SetStatus(uploadtask.StatusPENDING)
+		}
+		id, err := create.
 			OnConflictColumns(uploadtask.SourceArtifactColumn).
 			DoNothing().
-			Exec(l.ctx); err != nil {
+			ID(l.ctx)
+		if err != nil {
 			if db.IsNoRows(err) {
 				continue
 			}
 			return errors.Wrap(err, "create upload task")
 		}
+		if copyErr != nil {
+			l.Errorf("archive long-term copy failed: %v", copyErr)
+			_ = l.notifyCopyFailure(conf, relativePath, copyErr)
+			continue
+		}
+		if needsLocalDelete {
+			if err := l.deleteLocalArtifacts(conf.BaseDir, artifact); err != nil {
+				deleteErr := errors.Wrapf(err, "delete local artifacts after long-term copy %s", relativePath)
+				_ = l.svcCtx.DB.UploadTask.UpdateOneID(id).
+					SetStatus(uploadtask.StatusFAILED).
+					SetErrorMessage(deleteErr.Error()).
+					Exec(l.ctx)
+				l.Errorf("archive long-term cleanup failed: %v", deleteErr)
+				_ = l.notifyCopyFailure(conf, relativePath, deleteErr)
+				continue
+			}
+			if err := l.svcCtx.DB.UploadTask.UpdateOneID(id).
+				SetStatus(uploadtask.StatusSUCCEEDED).
+				SetCompletedAt(time.Now()).
+				Exec(l.ctx); err != nil {
+				return errors.Wrap(err, "mark archive copy succeeded")
+			}
+		}
+		if conf.DisableFileUpload {
+			_ = db.Notify(l.ctx, l.svcCtx.Config.PostgresConf.DSN, db.UploadTaskChangedChannel, strconv.Itoa(id))
+		}
 	}
 	return nil
 }
 
-func (l *DispatchLogic) ensureTable(appToken, tableName string) (string, error) {
+func (l *DispatchLogic) archiveLongTermCopy(conf common.UploadConf, artifact *ent.MediaArtifact, relativePath string) error {
+	if strings.TrimSpace(conf.LongTermBaseDir) == "" {
+		return nil
+	}
+	sourcePath := storagepath.Resolve(conf.BaseDir, relativePath)
+	targetPath := storagepath.Resolve(conf.LongTermBaseDir, relativePath)
+	if err := copyAndVerify(sourcePath, targetPath, artifact.Checksum); err != nil {
+		return errors.Wrapf(err, "copy %s to long-term storage", relativePath)
+	}
+	return nil
+}
+
+func copyAndVerify(sourcePath, targetPath string, expectedChecksum *string) error {
+	sourceInfo, err := os.Stat(sourcePath)
+	if err != nil {
+		return errors.Wrap(err, "stat source")
+	}
+	if sourceInfo.IsDir() {
+		return errors.Errorf("source is a directory: %s", sourcePath)
+	}
+	checksum := ""
+	if expectedChecksum != nil && *expectedChecksum != "" {
+		checksum = *expectedChecksum
+	} else {
+		checksum, err = fileChecksum(sourcePath)
+		if err != nil {
+			return errors.Wrap(err, "checksum source")
+		}
+	}
+	if err := verifyCopiedFile(targetPath, sourceInfo.Size(), checksum); err == nil {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+		return errors.Wrap(err, "create long-term dir")
+	}
+	tmpPath := fmt.Sprintf("%s.tmp.%d.%d", targetPath, os.Getpid(), time.Now().UnixNano())
+	if err := copyFile(sourcePath, tmpPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, targetPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return errors.Wrap(err, "rename copied file")
+	}
+	return verifyCopiedFile(targetPath, sourceInfo.Size(), checksum)
+}
+
+func copyFile(sourcePath, targetPath string) error {
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		return errors.Wrap(err, "open source")
+	}
+	defer source.Close()
+	target, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return errors.Wrap(err, "create target")
+	}
+	_, copyErr := io.Copy(target, source)
+	syncErr := target.Sync()
+	closeErr := target.Close()
+	switch {
+	case copyErr != nil:
+		return errors.Wrap(copyErr, "copy file")
+	case syncErr != nil:
+		return errors.Wrap(syncErr, "sync target")
+	case closeErr != nil:
+		return errors.Wrap(closeErr, "close target")
+	default:
+		return nil
+	}
+}
+
+func verifyCopiedFile(filePath string, expectedSize int64, expectedChecksum string) error {
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return errors.Wrap(err, "stat copied file")
+	}
+	if info.Size() != expectedSize {
+		return errors.Errorf("copied file size mismatch: got %d want %d", info.Size(), expectedSize)
+	}
+	if expectedChecksum == "" {
+		return nil
+	}
+	checksum, err := fileChecksum(filePath)
+	if err != nil {
+		return errors.Wrap(err, "checksum copied file")
+	}
+	if checksum != expectedChecksum {
+		return errors.Errorf("copied file checksum mismatch: got %s want %s", checksum, expectedChecksum)
+	}
+	return nil
+}
+
+func fileChecksum(filePath string) (string, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func (l *DispatchLogic) deleteLocalArtifacts(baseDir string, archive *ent.MediaArtifact) error {
+	now := time.Now()
+	artifacts := []*ent.MediaArtifact{archive}
+	if archive.Edges.RecordTask != nil {
+		for _, artifact := range archive.Edges.RecordTask.Edges.MediaArtifacts {
+			if artifact.ID == archive.ID || artifact.Status != mediaartifact.StatusAVAILABLE {
+				continue
+			}
+			if artifact.Kind == mediaartifact.KindSource || artifact.Kind == mediaartifact.KindArchive {
+				artifacts = append(artifacts, artifact)
+			}
+		}
+	}
+	seen := make(map[int]struct{}, len(artifacts))
+	for _, artifact := range artifacts {
+		if _, ok := seen[artifact.ID]; ok {
+			continue
+		}
+		seen[artifact.ID] = struct{}{}
+		fullPath := storagepath.Resolve(baseDir, artifact.Path)
+		if err := os.Remove(fullPath); err != nil && !os.IsNotExist(err) {
+			return errors.Wrapf(err, "remove local artifact %s", artifact.Path)
+		}
+		if err := l.svcCtx.DB.MediaArtifact.UpdateOneID(artifact.ID).
+			SetStatus(mediaartifact.StatusDELETED).
+			SetDeletedAt(now).
+			Exec(l.ctx); err != nil {
+			return errors.Wrapf(err, "mark local artifact deleted %s", artifact.Path)
+		}
+	}
+	return nil
+}
+
+func (l *DispatchLogic) ensureTable(appToken, tableName string, includeAttachment bool) (string, error) {
 	cacheKey := fmt.Sprintf("rm-monitor:bitable:table:%s:%s", appToken, tableName)
 	if tableID, err := l.svcCtx.Redis.GetCtx(l.ctx, cacheKey); err != nil {
 		return "", errors.Wrap(err, "get bitable table cache")
 	} else if tableID != "" {
-		if err := l.ensureTableFields(appToken, tableID); err != nil {
+		if err := l.ensureTableFields(appToken, tableID, includeAttachment); err != nil {
 			return "", err
 		}
 		return tableID, nil
@@ -115,7 +308,7 @@ func (l *DispatchLogic) ensureTable(appToken, tableName string) (string, error) 
 	if tableID, err := l.findTable(appToken, tableName); err != nil {
 		return "", err
 	} else if tableID != "" {
-		if err := l.ensureTableFields(appToken, tableID); err != nil {
+		if err := l.ensureTableFields(appToken, tableID, includeAttachment); err != nil {
 			return "", err
 		}
 		_ = l.svcCtx.Redis.SetexCtx(l.ctx, cacheKey, tableID, tableCacheTTL)
@@ -133,7 +326,7 @@ func (l *DispatchLogic) ensureTable(appToken, tableName string) (string, error) 
 			if tableID, err := l.svcCtx.Redis.GetCtx(l.ctx, cacheKey); err != nil {
 				return "", errors.Wrap(err, "get bitable table cache")
 			} else if tableID != "" {
-				if err := l.ensureTableFields(appToken, tableID); err != nil {
+				if err := l.ensureTableFields(appToken, tableID, includeAttachment); err != nil {
 					return "", err
 				}
 				return tableID, nil
@@ -141,7 +334,7 @@ func (l *DispatchLogic) ensureTable(appToken, tableName string) (string, error) 
 			if tableID, err := l.findTable(appToken, tableName); err != nil {
 				return "", err
 			} else if tableID != "" {
-				if err := l.ensureTableFields(appToken, tableID); err != nil {
+				if err := l.ensureTableFields(appToken, tableID, includeAttachment); err != nil {
 					return "", err
 				}
 				_ = l.svcCtx.Redis.SetexCtx(l.ctx, cacheKey, tableID, tableCacheTTL)
@@ -154,7 +347,7 @@ func (l *DispatchLogic) ensureTable(appToken, tableName string) (string, error) 
 	if tableID, err := l.findTable(appToken, tableName); err != nil {
 		return "", err
 	} else if tableID != "" {
-		if err := l.ensureTableFields(appToken, tableID); err != nil {
+		if err := l.ensureTableFields(appToken, tableID, includeAttachment); err != nil {
 			return "", err
 		}
 		_ = l.svcCtx.Redis.SetexCtx(l.ctx, cacheKey, tableID, tableCacheTTL)
@@ -172,7 +365,7 @@ func (l *DispatchLogic) ensureTable(appToken, tableName string) (string, error) 
 	if !resp.Success() || resp.Data == nil || resp.Data.TableId == nil {
 		return "", errors.Wrap(resp, "create bitable table")
 	}
-	if err := l.ensureTableFields(appToken, *resp.Data.TableId); err != nil {
+	if err := l.ensureTableFields(appToken, *resp.Data.TableId, includeAttachment); err != nil {
 		return "", err
 	}
 	_ = l.svcCtx.Redis.SetexCtx(l.ctx, cacheKey, *resp.Data.TableId, tableCacheTTL)
@@ -210,18 +403,21 @@ func (l *DispatchLogic) findTable(appToken, tableName string) (string, error) {
 	}
 }
 
-func (l *DispatchLogic) ensureTableFields(appToken, tableID string) error {
+func (l *DispatchLogic) ensureTableFields(appToken, tableID string, includeAttachment bool) error {
 	existing, err := l.listFields(appToken, tableID)
 	if err != nil {
 		return err
 	}
 	required := map[string]int{
-		bitableupload.FieldRole:       larkbitable.TypeSingleSelect,
-		bitableupload.FieldMatch:      larkbitable.TypeSingleSelect,
-		bitableupload.FieldType:       larkbitable.TypeSingleSelect,
-		bitableupload.FieldRedTeam:    larkbitable.TypeSingleSelect,
-		bitableupload.FieldBlueTeam:   larkbitable.TypeSingleSelect,
-		bitableupload.FieldAttachment: larkbitable.TypeAttachment,
+		bitableupload.FieldRole:     larkbitable.TypeSingleSelect,
+		bitableupload.FieldMatch:    larkbitable.TypeSingleSelect,
+		bitableupload.FieldType:     larkbitable.TypeSingleSelect,
+		bitableupload.FieldRedTeam:  larkbitable.TypeSingleSelect,
+		bitableupload.FieldBlueTeam: larkbitable.TypeSingleSelect,
+		bitableupload.FieldFilePath: larkbitable.TypeText,
+	}
+	if includeAttachment {
+		required[bitableupload.FieldAttachment] = larkbitable.TypeAttachment
 	}
 	for name, fieldType := range required {
 		if _, ok := existing[name]; ok {
@@ -279,12 +475,12 @@ func (l *DispatchLogic) listFields(appToken, tableID string) (map[string]int, er
 	}
 }
 
-func (l *DispatchLogic) createBitableRecord(appToken, tableID string, _ int, match *ent.Match, role string) (string, *string, error) {
+func (l *DispatchLogic) createBitableRecord(appToken, tableID string, _ int, match *ent.Match, role, filePath string) (string, *string, error) {
 	resp, err := l.svcCtx.Lark.Bitable.V1.AppTableRecord.Create(l.ctx, larkbitable.NewCreateAppTableRecordReqBuilder().
 		AppToken(appToken).
 		TableId(tableID).
 		AppTableRecord(larkbitable.NewAppTableRecordBuilder().
-			Fields(bitableupload.RecordFields(match, role)).
+			Fields(bitableupload.RecordFieldsWithPath(match, role, filePath)).
 			Build()).
 		Build())
 	if err != nil {
@@ -302,6 +498,173 @@ func (l *DispatchLogic) createBitableRecord(appToken, tableID string, _ int, mat
 	}
 	url := fmt.Sprintf("https://scutrobotlab.feishu.cn/base/%s?table=%s&record=%s", appToken, tableID, *record.RecordId)
 	return *record.RecordId, &url, nil
+}
+
+func relativeArtifactPath(p string) (string, error) {
+	rel := path.Clean(filepath.ToSlash(strings.TrimSpace(p)))
+	if rel == "." || rel == "" {
+		return "", errors.New("empty artifact path")
+	}
+	if strings.HasPrefix(rel, "/") || rel == ".." || strings.HasPrefix(rel, "../") {
+		return "", errors.Errorf("artifact path escapes records dir: %s", p)
+	}
+	return rel, nil
+}
+
+func (l *DispatchLogic) notifyCopyFailure(conf common.UploadConf, relativePath string, copyErr error) error {
+	chatIDs, err := l.joinedChatIDs()
+	if err != nil {
+		return err
+	}
+	for _, chatID := range chatIDs {
+		mentionID := strings.TrimSpace(conf.CopyFailureMentionOpenID)
+		if mentionID == "" && strings.TrimSpace(conf.CopyFailureMentionName) != "" {
+			if id, err := l.findChatMemberOpenID(chatID, conf.CopyFailureMentionName); err == nil {
+				mentionID = id
+			} else {
+				l.Errorf("find lark mention member %s failed: %v", conf.CopyFailureMentionName, err)
+			}
+		}
+		content, err := copyFailureContent(conf, relativePath, copyErr, mentionID)
+		if err != nil {
+			return err
+		}
+		resp, err := l.svcCtx.Lark.Im.V1.Message.Create(l.ctx, larkim.NewCreateMessageReqBuilder().
+			ReceiveIdType(larkim.ReceiveIdTypeChatId).
+			Body(larkim.NewCreateMessageReqBodyBuilder().
+				ReceiveId(chatID).
+				MsgType(larkim.MsgTypePost).
+				Content(content).
+				Build()).
+			Build())
+		if err != nil {
+			return errors.Wrap(err, "send copy failure message")
+		}
+		if !resp.Success() {
+			return errors.Wrap(resp, "send copy failure message")
+		}
+	}
+	return nil
+}
+
+func (l *DispatchLogic) joinedChatIDs() ([]string, error) {
+	pageToken := ""
+	var ids []string
+	for {
+		builder := larkim.NewListChatReqBuilder().PageSize(20)
+		if pageToken != "" {
+			builder.PageToken(pageToken)
+		}
+		resp, err := l.svcCtx.Lark.Im.V1.Chat.List(l.ctx, builder.Build())
+		if err != nil {
+			return nil, errors.Wrap(err, "list lark chats")
+		}
+		if !resp.Success() {
+			return nil, errors.Wrap(resp, "list lark chats")
+		}
+		if resp.Data != nil {
+			for _, chat := range resp.Data.Items {
+				if chat.ChatId != nil && *chat.ChatId != "" {
+					ids = append(ids, *chat.ChatId)
+				}
+			}
+			if resp.Data.HasMore != nil && *resp.Data.HasMore && resp.Data.PageToken != nil && *resp.Data.PageToken != "" {
+				pageToken = *resp.Data.PageToken
+				continue
+			}
+		}
+		return ids, nil
+	}
+}
+
+func (l *DispatchLogic) findChatMemberOpenID(chatID, name string) (string, error) {
+	targetName := strings.TrimSpace(name)
+	if targetName == "" {
+		return "", errors.New("empty mention name")
+	}
+	pageToken := ""
+	for {
+		builder := larkim.NewGetChatMembersReqBuilder().
+			ChatId(chatID).
+			MemberIdType(larkim.MemberIdTypeGetChatMembersOpenId).
+			PageSize(50)
+		if pageToken != "" {
+			builder.PageToken(pageToken)
+		}
+		resp, err := l.svcCtx.Lark.Im.V1.ChatMembers.Get(l.ctx, builder.Build())
+		if err != nil {
+			return "", errors.Wrap(err, "list lark chat members")
+		}
+		if !resp.Success() {
+			return "", errors.Wrap(resp, "list lark chat members")
+		}
+		if resp.Data != nil {
+			for _, member := range resp.Data.Items {
+				if member.MemberId == nil || member.Name == nil {
+					continue
+				}
+				memberName := strings.TrimSpace(*member.Name)
+				if memberName == targetName || strings.Contains(memberName, targetName) {
+					return *member.MemberId, nil
+				}
+			}
+			if resp.Data.HasMore != nil && *resp.Data.HasMore && resp.Data.PageToken != nil && *resp.Data.PageToken != "" {
+				pageToken = *resp.Data.PageToken
+				continue
+			}
+		}
+		return "", errors.Errorf("member %s not found in chat %s", targetName, chatID)
+	}
+}
+
+func copyFailureContent(conf common.UploadConf, relativePath string, copyErr error, mentionOpenID string) (string, error) {
+	mentionName := strings.TrimSpace(conf.CopyFailureMentionName)
+	if mentionName == "" {
+		mentionName = "席伟杰"
+	}
+	firstLine := []map[string]string{}
+	if mentionOpenID != "" {
+		firstLine = append(firstLine, map[string]string{
+			"tag":       "at",
+			"user_id":   mentionOpenID,
+			"user_name": mentionName,
+		})
+	} else {
+		firstLine = append(firstLine, map[string]string{
+			"tag":  "text",
+			"text": "@" + mentionName,
+		})
+	}
+	firstLine = append(firstLine, map[string]string{
+		"tag":  "text",
+		"text": " 录像归档到 Server_Data 失败",
+	})
+	body := fmt.Sprintf(
+		"相对路径：%s\n本机目录：%s\n长期目录：%s\n错误：%v",
+		relativePath,
+		storagepath.Resolve(conf.BaseDir, relativePath),
+		storagepath.Resolve(conf.LongTermBaseDir, relativePath),
+		copyErr,
+	)
+	content := map[string]any{
+		"zh_cn": map[string]any{
+			"title": "录像归档失败",
+			"content": [][]map[string]string{
+				firstLine,
+				{
+					{
+						"tag":  "text",
+						"text": body,
+					},
+				},
+			},
+		},
+	}
+	b, err := json.Marshal(content)
+	if err != nil {
+		return "", errors.Wrap(err, "marshal copy failure content")
+	}
+	return string(b), nil
 }
 
 func (l *DispatchLogic) recoverDispatching() error {
@@ -340,6 +703,9 @@ func (l *DispatchLogic) recoverDispatching() error {
 
 func (l *DispatchLogic) dispatchPending() error {
 	conf := l.svcCtx.Config.UploadConf.WithDefaults()
+	if conf.DisableFileUpload {
+		return nil
+	}
 	running, err := l.svcCtx.DB.UploadTask.Query().Where(uploadtask.StatusIn(uploadtask.StatusDISPATCHING, uploadtask.StatusRUNNING)).Count(l.ctx)
 	if err != nil {
 		return errors.Wrap(err, "count running upload tasks")

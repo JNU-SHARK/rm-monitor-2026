@@ -107,19 +107,31 @@ type LarkConf struct {
 }
 
 type UploadConf struct {
-	BaseDir            string `json:",optional"`
-	BitableAppToken    string `json:",optional"`
-	Concurrency        int    `json:",optional"`
-	PartRetries        int    `json:",optional"`
-	RetryBackoff       int    `json:",optional"`
-	RateLimitKey       string `json:",optional"`
-	RateLimitPerMinute int    `json:",optional"`
+	BaseDir                  string `json:",optional"`
+	FilePathBaseDir          string `json:",optional"`
+	LongTermBaseDir          string `json:",optional"`
+	BitableAppToken          string `json:",optional"`
+	DisableFileUpload        bool   `json:",optional"`
+	DeleteLocalAfterCopy     bool   `json:",optional"`
+	CopyFailureMentionName   string `json:",optional"`
+	CopyFailureMentionOpenID string `json:",optional"`
+	Concurrency              int    `json:",optional"`
+	PartRetries              int    `json:",optional"`
+	RetryBackoff             int    `json:",optional"`
+	RateLimitKey             string `json:",optional"`
+	RateLimitPerMinute       int    `json:",optional"`
 }
 
 func (c *UploadConf) WithDefaults() UploadConf {
 	out := *c
 	if out.BaseDir == "" {
 		out.BaseDir = "/records"
+	}
+	if out.FilePathBaseDir == "" {
+		out.FilePathBaseDir = out.BaseDir
+	}
+	if out.CopyFailureMentionName == "" {
+		out.CopyFailureMentionName = "席伟杰"
 	}
 	if out.Concurrency <= 0 {
 		out.Concurrency = 1

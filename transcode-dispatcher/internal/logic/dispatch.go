@@ -198,7 +198,9 @@ func (l *DispatchLogic) cleanupExpiredSources() error {
 		).
 		WithUploadTask().
 		WithSourceTranscodeTask(func(q *ent.TranscodeTaskQuery) {
-			q.WithArchiveArtifact()
+			q.WithArchiveArtifact(func(q *ent.MediaArtifactQuery) {
+				q.WithUploadTask()
+			})
 		}).
 		Limit(100).
 		All(l.ctx)
@@ -206,9 +208,15 @@ func (l *DispatchLogic) cleanupExpiredSources() error {
 		return errors.Wrap(err, "query deletable sources")
 	}
 	for _, artifact := range artifacts {
-		upload := artifact.Edges.UploadTask
 		transcode := artifact.Edges.SourceTranscodeTask
-		if upload == nil || upload.Status != uploadtask.StatusSUCCEEDED || transcode == nil || transcode.Status != transcodetask.StatusSUCCEEDED || transcode.Edges.ArchiveArtifact == nil {
+		if transcode == nil || transcode.Status != transcodetask.StatusSUCCEEDED || transcode.Edges.ArchiveArtifact == nil {
+			continue
+		}
+		sourceUpload := artifact.Edges.UploadTask
+		archiveUpload := transcode.Edges.ArchiveArtifact.Edges.UploadTask
+		uploaded := sourceUpload != nil && sourceUpload.Status == uploadtask.StatusSUCCEEDED
+		uploaded = uploaded || archiveUpload != nil && archiveUpload.Status == uploadtask.StatusSUCCEEDED
+		if !uploaded {
 			continue
 		}
 		fullPath := storagepath.Resolve(conf.BaseDir, artifact.Path)

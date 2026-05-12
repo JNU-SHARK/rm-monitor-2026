@@ -1,0 +1,194 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: monitor-config
+data:
+  config.yml: |
+    PostgresConf:
+      DSN: postgres://rm_monitor:rm_monitor@10.43.83.22:5432/rm_monitor?sslmode=disable
+      AutoMigrate: true
+    RedisConf:
+      Host: 10.43.61.177:6379
+      Type: node
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lark-notifier-config
+data:
+  config.yml: |
+    LarkConf:
+      AppId: ""
+      AppSecret: ""
+    RedisConf:
+      Host: 10.43.61.177:6379
+      Pass: ""
+    PostgresConf:
+      DSN: postgres://rm_monitor:rm_monitor@10.43.83.22:5432/rm_monitor?sslmode=disable
+      AutoMigrate: true
+    RecordConf:
+      BaseDir: /records
+    UploadConf:
+      Concurrency: 1
+      PartRetries: 3
+      RetryBackoff: 2
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: record-dispatcher-config
+data:
+  config.yml: |
+    PostgresConf:
+      DSN: postgres://rm_monitor:rm_monitor@10.43.83.22:5432/rm_monitor?sslmode=disable
+      AutoMigrate: true
+    RecordConf:
+      Res: high
+      BaseDir: /records
+      PathTemplate: "{{.Event}}/{{.Zone}}/{{.MatchName}}/Round-{{.RoundNo}}/{{.Role}}.flv"
+      MatchDirTemplate: "{{.Event}}/{{.Zone}}/{{.MatchName}}"
+      MatchNameTemplate: "{{.Order}}. {{.RedSchool}}-{{.RedName}} VS {{.BlueSchool}}-{{.BlueName}}"
+    K8sJobConf:
+      Namespace: rm-monitor
+      Image: rm-monitor/record-job:latest
+      ConfigMapName: record-job-config
+      ServiceAccountName: rm-monitor-dispatcher
+      RecordsPVC: rm-monitor-records
+      RecordsMountPath: /records
+      ImagePullPolicy: IfNotPresent
+      TTLSecondsAfterFinished: 86400
+    ManifestJobConf:
+      Namespace: rm-monitor
+      Image: rm-monitor/manifest-job:latest
+      ConfigMapName: manifest-job-config
+      ServiceAccountName: rm-monitor-dispatcher
+      RecordsPVC: rm-monitor-records
+      RecordsMountPath: /records
+      ImagePullPolicy: IfNotPresent
+      TTLSecondsAfterFinished: 86400
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: record-job-config
+data:
+  config.yml: |
+    PostgresConf:
+      DSN: postgres://rm_monitor:rm_monitor@10.43.83.22:5432/rm_monitor?sslmode=disable
+      AutoMigrate: false
+    RecordConf:
+      Res: high
+      BaseDir: /records
+      PathTemplate: "{{.Event}}/{{.Zone}}/{{.MatchName}}/Round-{{.RoundNo}}/{{.Role}}.flv"
+      MatchDirTemplate: "{{.Event}}/{{.Zone}}/{{.MatchName}}"
+      MatchNameTemplate: "{{.Order}}. {{.RedSchool}}-{{.RedName}} VS {{.BlueSchool}}-{{.BlueName}}"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: manifest-job-config
+data:
+  config.yml: |
+    PostgresConf:
+      DSN: postgres://rm_monitor:rm_monitor@10.43.83.22:5432/rm_monitor?sslmode=disable
+      AutoMigrate: false
+    RecordConf:
+      Res: high
+      BaseDir: /records
+      PathTemplate: "{{.Event}}/{{.Zone}}/{{.MatchName}}/Round-{{.RoundNo}}/{{.Role}}.flv"
+      MatchDirTemplate: "{{.Event}}/{{.Zone}}/{{.MatchName}}"
+      MatchNameTemplate: "{{.Order}}. {{.RedSchool}}-{{.RedName}} VS {{.BlueSchool}}-{{.BlueName}}"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: transcode-dispatcher-config
+data:
+  config.yml: |
+    PostgresConf:
+      DSN: postgres://rm_monitor:rm_monitor@10.43.83.22:5432/rm_monitor?sslmode=disable
+      AutoMigrate: true
+    TranscodeConf:
+      BaseDir: /records
+      AllowedWindow: "23:00-06:00"
+      SuspendWhenRecordingActive: true
+      SourceRetentionDays: 7
+      CPURequest: "500m"
+      MemoryRequest: "512Mi"
+      MemoryLimit: "2Gi"
+    K8sJobConf:
+      Namespace: rm-monitor
+      Image: rm-monitor/transcode-job:latest
+      ConfigMapName: transcode-job-config
+      ServiceAccountName: rm-monitor-dispatcher
+      RecordsPVC: rm-monitor-records
+      RecordsMountPath: /records
+      ImagePullPolicy: IfNotPresent
+      TTLSecondsAfterFinished: 86400
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: transcode-job-config
+data:
+  config.yml: |
+    PostgresConf:
+      DSN: postgres://rm_monitor:rm_monitor@10.43.83.22:5432/rm_monitor?sslmode=disable
+      AutoMigrate: false
+    TranscodeConf:
+      BaseDir: /records
+      SourceRetentionDays: 7
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: uploader-dispatcher-config
+data:
+  config.yml: |
+    PostgresConf:
+      DSN: postgres://rm_monitor:rm_monitor@10.43.83.22:5432/rm_monitor?sslmode=disable
+      AutoMigrate: true
+    RedisConf:
+      Host: 10.43.61.177:6379
+      Pass: ""
+    LarkConf:
+      AppId: ""
+      AppSecret: ""
+    UploadConf:
+      BaseDir: /records
+      LongTermBaseDir: /server-data
+      BitableAppToken: E2embrciuaax6sscQKwcTdHdnZf
+      DisableFileUpload: true
+      DeleteLocalAfterCopy: true
+      CopyFailureMentionName: 席伟杰
+      Concurrency: 1
+    K8sJobConf:
+      Namespace: rm-monitor
+      Image: rm-monitor/uploader-job:latest
+      ConfigMapName: uploader-job-config
+      ServiceAccountName: rm-monitor-dispatcher
+      RecordsPVC: rm-monitor-records
+      RecordsMountPath: /records
+      ImagePullPolicy: IfNotPresent
+      TTLSecondsAfterFinished: 86400
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: uploader-job-config
+data:
+  config.yml: |
+    PostgresConf:
+      DSN: postgres://rm_monitor:rm_monitor@10.43.83.22:5432/rm_monitor?sslmode=disable
+      AutoMigrate: false
+    LarkConf:
+      AppId: ""
+      AppSecret: ""
+    RedisConf:
+      Host: 10.43.61.177:6379
+      Pass: ""
+    UploadConf:
+      BaseDir: /records
+      PartRetries: 3
+      RetryBackoff: 2
+      RateLimitPerMinute: 30
