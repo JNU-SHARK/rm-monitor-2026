@@ -101,6 +101,10 @@ func UploadReplyUUID(uploadTaskID int, messageID string) string {
 	return shortUUID("rm-upload-reply", fmt.Sprintf("%d", uploadTaskID), messageID)
 }
 
+func FailureAlertUUID(alertKey, chatID string) string {
+	return shortUUID("rm-failure-alert", alertKey, chatID)
+}
+
 func shortUUID(prefix string, parts ...string) string {
 	h := sha256.New()
 	for _, part := range parts {

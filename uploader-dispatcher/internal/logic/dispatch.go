@@ -39,6 +39,11 @@ const dispatchingStaleAfter = 5 * time.Minute
 const tableCacheTTL = 24 * 3600
 const tableLockTTL = 30
 
+type bitableFieldSpec struct {
+	name      string
+	fieldType int
+}
+
 func NewDispatchLogic(ctx context.Context, svcCtx *svc.ServiceContext) *DispatchLogic {
 	return &DispatchLogic{ctx: ctx, svcCtx: svcCtx, Logger: logx.WithContext(ctx)}
 }
@@ -58,9 +63,13 @@ func (l *DispatchLogic) createUploadTasks() error {
 	if strings.TrimSpace(conf.BitableAppToken) == "" {
 		return errors.New("UploadConf.BitableAppToken is required")
 	}
+	artifactKind, err := uploadArtifactKind(conf)
+	if err != nil {
+		return err
+	}
 	artifacts, err := l.svcCtx.DB.MediaArtifact.Query().
 		Where(
-			mediaartifact.KindEQ(mediaartifact.KindArchive),
+			mediaartifact.KindEQ(artifactKind),
 			mediaartifact.StatusEQ(mediaartifact.StatusAVAILABLE),
 			mediaartifact.HasRecordTask(),
 			mediaartifact.Not(mediaartifact.HasUploadTask()),
@@ -76,7 +85,7 @@ func (l *DispatchLogic) createUploadTasks() error {
 		Limit(100).
 		All(l.ctx)
 	if err != nil {
-		return errors.Wrap(err, "query archive artifacts")
+		return errors.Wrapf(err, "query %s artifacts", artifactKind)
 	}
 	for _, artifact := range artifacts {
 		recordTask := artifact.Edges.RecordTask
@@ -96,7 +105,7 @@ func (l *DispatchLogic) createUploadTasks() error {
 		if err != nil {
 			return err
 		}
-		copyErr := l.archiveLongTermCopy(conf, artifact, relativePath)
+		copyErr := l.artifactLongTermCopy(conf, artifact, relativePath)
 		needsLocalDelete := copyErr == nil && conf.DisableFileUpload && conf.LongTermBaseDir != "" && conf.DeleteLocalAfterCopy
 		create := l.svcCtx.DB.UploadTask.Create().
 			SetRecordTaskID(recordTask.ID).
@@ -127,7 +136,7 @@ func (l *DispatchLogic) createUploadTasks() error {
 			return errors.Wrap(err, "create upload task")
 		}
 		if copyErr != nil {
-			l.Errorf("archive long-term copy failed: %v", copyErr)
+			l.Errorf("artifact long-term copy failed: %v", copyErr)
 			_ = l.notifyCopyFailure(conf, relativePath, copyErr)
 			continue
 		}
@@ -146,7 +155,7 @@ func (l *DispatchLogic) createUploadTasks() error {
 				SetStatus(uploadtask.StatusSUCCEEDED).
 				SetCompletedAt(time.Now()).
 				Exec(l.ctx); err != nil {
-				return errors.Wrap(err, "mark archive copy succeeded")
+				return errors.Wrap(err, "mark artifact copy succeeded")
 			}
 		}
 		if conf.DisableFileUpload {
@@ -156,7 +165,18 @@ func (l *DispatchLogic) createUploadTasks() error {
 	return nil
 }
 
-func (l *DispatchLogic) archiveLongTermCopy(conf common.UploadConf, artifact *ent.MediaArtifact, relativePath string) error {
+func uploadArtifactKind(conf common.UploadConf) (mediaartifact.Kind, error) {
+	kind := mediaartifact.Kind(strings.TrimSpace(conf.ArtifactKind))
+	if kind == "" {
+		return mediaartifact.KindArchive, nil
+	}
+	if err := mediaartifact.KindValidator(kind); err != nil {
+		return "", err
+	}
+	return kind, nil
+}
+
+func (l *DispatchLogic) artifactLongTermCopy(conf common.UploadConf, artifact *ent.MediaArtifact, relativePath string) error {
 	if strings.TrimSpace(conf.LongTermBaseDir) == "" {
 		return nil
 	}
@@ -356,7 +376,11 @@ func (l *DispatchLogic) ensureTable(appToken, tableName string, includeAttachmen
 	resp, err := l.svcCtx.Lark.Bitable.V1.AppTable.Create(l.ctx, larkbitable.NewCreateAppTableReqBuilder().
 		AppToken(appToken).
 		Body(larkbitable.NewCreateAppTableReqBodyBuilder().
-			Table(larkbitable.NewReqTableBuilder().Name(tableName).Build()).
+			Table(larkbitable.NewReqTableBuilder().
+				Name(tableName).
+				DefaultViewName("表格").
+				Fields(bitableCreateHeaders(includeAttachment)).
+				Build()).
 			Build()).
 		Build())
 	if err != nil {
@@ -408,37 +432,58 @@ func (l *DispatchLogic) ensureTableFields(appToken, tableID string, includeAttac
 	if err != nil {
 		return err
 	}
-	required := map[string]int{
-		bitableupload.FieldRole:     larkbitable.TypeSingleSelect,
-		bitableupload.FieldMatch:    larkbitable.TypeSingleSelect,
-		bitableupload.FieldType:     larkbitable.TypeSingleSelect,
-		bitableupload.FieldRedTeam:  larkbitable.TypeSingleSelect,
-		bitableupload.FieldBlueTeam: larkbitable.TypeSingleSelect,
-		bitableupload.FieldFilePath: larkbitable.TypeText,
-	}
-	if includeAttachment {
-		required[bitableupload.FieldAttachment] = larkbitable.TypeAttachment
-	}
-	for name, fieldType := range required {
-		if _, ok := existing[name]; ok {
+	for _, field := range bitableFields(includeAttachment) {
+		existingType, ok := existing[field.name]
+		if ok {
+			if existingType != field.fieldType {
+				return errors.Errorf("bitable field %s has type %d, expected %d", field.name, existingType, field.fieldType)
+			}
 			continue
 		}
 		resp, err := l.svcCtx.Lark.Bitable.V1.AppTableField.Create(l.ctx, larkbitable.NewCreateAppTableFieldReqBuilder().
 			AppToken(appToken).
 			TableId(tableID).
 			AppTableField(larkbitable.NewAppTableFieldBuilder().
-				FieldName(name).
-				Type(fieldType).
+				FieldName(field.name).
+				Type(field.fieldType).
 				Build()).
 			Build())
 		if err != nil {
-			return errors.Wrapf(err, "create bitable field %s", name)
+			return errors.Wrapf(err, "create bitable field %s", field.name)
 		}
 		if !resp.Success() {
-			return errors.Errorf("create bitable field %s: code=%d msg=%s", name, resp.Code, resp.Msg)
+			return errors.Errorf("create bitable field %s: code=%d msg=%s", field.name, resp.Code, resp.Msg)
 		}
 	}
 	return nil
+}
+
+func bitableFields(includeAttachment bool) []bitableFieldSpec {
+	fields := []bitableFieldSpec{
+		{name: bitableupload.FieldMatch, fieldType: larkbitable.TypeSingleSelect},
+		{name: bitableupload.FieldStage, fieldType: larkbitable.TypeSingleSelect},
+		{name: bitableupload.FieldRedTeam, fieldType: larkbitable.TypeSingleSelect},
+		{name: bitableupload.FieldBlueTeam, fieldType: larkbitable.TypeSingleSelect},
+		{name: bitableupload.FieldRole, fieldType: larkbitable.TypeSingleSelect},
+		{name: bitableupload.FieldFilePath, fieldType: larkbitable.TypeText},
+		{name: bitableupload.FieldBilibili, fieldType: larkbitable.TypeUrl},
+	}
+	if includeAttachment {
+		fields = append(fields, bitableFieldSpec{name: bitableupload.FieldAttachment, fieldType: larkbitable.TypeAttachment})
+	}
+	return fields
+}
+
+func bitableCreateHeaders(includeAttachment bool) []*larkbitable.AppTableCreateHeader {
+	fields := bitableFields(includeAttachment)
+	headers := make([]*larkbitable.AppTableCreateHeader, 0, len(fields))
+	for _, field := range fields {
+		headers = append(headers, larkbitable.NewAppTableCreateHeaderBuilder().
+			FieldName(field.name).
+			Type(field.fieldType).
+			Build())
+	}
+	return headers
 }
 
 func (l *DispatchLogic) listFields(appToken, tableID string) (map[string]int, error) {
@@ -622,7 +667,17 @@ func copyFailureContent(conf common.UploadConf, relativePath string, copyErr err
 	if mentionName == "" {
 		mentionName = "席伟杰"
 	}
-	firstLine := []map[string]string{}
+	firstLine := []map[string]string{
+		{
+			"tag":       "at",
+			"user_id":   "all",
+			"user_name": "所有人",
+		},
+		{
+			"tag":  "text",
+			"text": " 录像归档到 Server_Data 失败，请立即提醒" + mentionName + "修复",
+		},
+	}
 	if mentionOpenID != "" {
 		firstLine = append(firstLine, map[string]string{
 			"tag":       "at",
@@ -635,10 +690,6 @@ func copyFailureContent(conf common.UploadConf, relativePath string, copyErr err
 			"text": "@" + mentionName,
 		})
 	}
-	firstLine = append(firstLine, map[string]string{
-		"tag":  "text",
-		"text": " 录像归档到 Server_Data 失败",
-	})
 	body := fmt.Sprintf(
 		"相对路径：%s\n本机目录：%s\n长期目录：%s\n错误：%v",
 		relativePath,

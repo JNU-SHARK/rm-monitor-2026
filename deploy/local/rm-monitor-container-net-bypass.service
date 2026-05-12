@@ -1,0 +1,12 @@
+[Unit]
+Description=Bypass Mihomo policy routing for RM Monitor container networks
+After=network-online.target k3s.service clash-verge-service.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/rm-monitor-container-net-bypass
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

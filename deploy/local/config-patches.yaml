@@ -29,6 +29,7 @@ data:
     RecordConf:
       BaseDir: /records
     UploadConf:
+      DisableFileUpload: true
       Concurrency: 1
       PartRetries: 3
       RetryBackoff: 2
@@ -45,7 +46,7 @@ data:
     RecordConf:
       Res: high
       BaseDir: /records
-      PathTemplate: "{{.Event}}/{{.Zone}}/{{.MatchName}}/Round-{{.RoundNo}}/{{.Role}}.flv"
+      PathTemplate: "{{.Event}}/{{.Zone}}/{{.MatchName}}/{{.Role}}.flv"
       MatchDirTemplate: "{{.Event}}/{{.Zone}}/{{.MatchName}}"
       MatchNameTemplate: "{{.Order}}. {{.RedSchool}}-{{.RedName}} VS {{.BlueSchool}}-{{.BlueName}}"
     K8sJobConf:
@@ -79,7 +80,7 @@ data:
     RecordConf:
       Res: high
       BaseDir: /records
-      PathTemplate: "{{.Event}}/{{.Zone}}/{{.MatchName}}/Round-{{.RoundNo}}/{{.Role}}.flv"
+      PathTemplate: "{{.Event}}/{{.Zone}}/{{.MatchName}}/{{.Role}}.flv"
       MatchDirTemplate: "{{.Event}}/{{.Zone}}/{{.MatchName}}"
       MatchNameTemplate: "{{.Order}}. {{.RedSchool}}-{{.RedName}} VS {{.BlueSchool}}-{{.BlueName}}"
 ---
@@ -95,7 +96,7 @@ data:
     RecordConf:
       Res: high
       BaseDir: /records
-      PathTemplate: "{{.Event}}/{{.Zone}}/{{.MatchName}}/Round-{{.RoundNo}}/{{.Role}}.flv"
+      PathTemplate: "{{.Event}}/{{.Zone}}/{{.MatchName}}/{{.Role}}.flv"
       MatchDirTemplate: "{{.Event}}/{{.Zone}}/{{.MatchName}}"
       MatchNameTemplate: "{{.Order}}. {{.RedSchool}}-{{.RedName}} VS {{.BlueSchool}}-{{.BlueName}}"
 ---
@@ -110,12 +111,14 @@ data:
       AutoMigrate: true
     TranscodeConf:
       BaseDir: /records
+      DisableTranscode: true
       AllowedWindow: "23:00-06:00"
       SuspendWhenRecordingActive: true
       SourceRetentionDays: 7
+      Concurrency: 2
       CPURequest: "500m"
-      MemoryRequest: "512Mi"
-      MemoryLimit: "2Gi"
+      MemoryRequest: "2Gi"
+      MemoryLimit: "8Gi"
     K8sJobConf:
       Namespace: rm-monitor
       Image: rm-monitor/transcode-job:latest
@@ -138,6 +141,10 @@ data:
     TranscodeConf:
       BaseDir: /records
       SourceRetentionDays: 7
+      EncoderPreset: "8"
+      EncoderParams: "lp=4"
+      VideoBitrate: "4000k"
+      AudioCodec: copy
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -156,10 +163,11 @@ data:
       AppSecret: ""
     UploadConf:
       BaseDir: /records
-      LongTermBaseDir: /server-data
+      LongTermBaseDir: ""
+      ArtifactKind: source
       BitableAppToken: E2embrciuaax6sscQKwcTdHdnZf
       DisableFileUpload: true
-      DeleteLocalAfterCopy: true
+      DeleteLocalAfterCopy: false
       CopyFailureMentionName: 席伟杰
       Concurrency: 1
     K8sJobConf:

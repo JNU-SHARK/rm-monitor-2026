@@ -4,3 +4,7 @@ PostgresConf:
 TranscodeConf:
   BaseDir: /records
   SourceRetentionDays: 7
+  EncoderPreset: "8"
+  EncoderParams: "lp=4"
+  VideoBitrate: "4000k"
+  AudioCodec: copy

@@ -1,0 +1,4 @@
+2026-05-12 16:27:25  INFO ThreadId(35) stream_gears::server: crates/stream-gears/src/server.rs:449: Tracing initialized with daily rotation
+2026-05-12 16:29:46  INFO ThreadId(35) biliup::uploader::credential: crates/biliup/src/uploader/credential.rs:343: 需要滑动验证码
+2026-05-12 16:32:40  INFO ThreadId(35) stream_gears::server: crates/stream-gears/src/server.rs:449: Tracing initialized with daily rotation
+2026-05-12 16:33:20  INFO ThreadId(35) biliup_cli::uploader: crates/biliup-cli/src/uploader.rs:99: 登录成功，数据保存在File { fd: 16, path: "/home/maverick/RM/rm-monitor-2026/cookies.json", read: false, write: true }

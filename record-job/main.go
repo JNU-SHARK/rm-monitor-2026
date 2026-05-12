@@ -96,10 +96,11 @@ func run(ctx context.Context, client *ent.Client, c config.Config, taskID int) e
 	args = append(args,
 		"-i", task.SourceURL,
 		"-map", "0:v:0",
-		"-an",
+		"-map", "0:a:0?",
 		"-sn",
 		"-dn",
 		"-c:v", "copy",
+		"-c:a", "copy",
 		"-f", "flv",
 		"-y", fullPath,
 	)
@@ -122,18 +123,18 @@ func run(ctx context.Context, client *ent.Client, c config.Config, taskID int) e
 	}
 	if err != nil && !stopRequested.Load() {
 		msg := commandError(err, stderr.String())
-		_ = client.RecordTask.UpdateOneID(taskID).SetStatus(recordtask.StatusFAILED).SetErrorMessage(msg).Exec(ctx)
+		markRecordFailed(ctx, client, c.PostgresConf.DSN, taskID, msg)
 		return errors.New(msg)
 	}
 
 	stat, statErr := os.Stat(fullPath)
 	if statErr != nil {
-		_ = client.RecordTask.UpdateOneID(taskID).SetStatus(recordtask.StatusFAILED).SetErrorMessage(statErr.Error()).Exec(ctx)
+		markRecordFailed(ctx, client, c.PostgresConf.DSN, taskID, statErr.Error())
 		return errors.Wrap(statErr, "stat output")
 	}
 	sum, err := checksum(fullPath)
 	if err != nil {
-		_ = client.RecordTask.UpdateOneID(taskID).SetStatus(recordtask.StatusFAILED).SetErrorMessage(err.Error()).Exec(ctx)
+		markRecordFailed(ctx, client, c.PostgresConf.DSN, taskID, err.Error())
 		return err
 	}
 	if err := client.RecordTask.UpdateOneID(taskID).
@@ -146,9 +147,20 @@ func run(ctx context.Context, client *ent.Client, c config.Config, taskID int) e
 		return errors.Wrap(err, "mark record succeeded")
 	}
 	if err := upsertSourceArtifact(ctx, client, taskID, task.OutputPath, stat.Size(), sum); err != nil {
+		markRecordFailed(ctx, client, c.PostgresConf.DSN, taskID, err.Error())
 		return errors.Wrap(err, "upsert source artifact")
 	}
 	return db.Notify(ctx, c.PostgresConf.DSN, db.RecordTaskChangedChannel, strconv.Itoa(taskID))
+}
+
+func markRecordFailed(ctx context.Context, client *ent.Client, dsn string, taskID int, msg string) {
+	if err := client.RecordTask.UpdateOneID(taskID).SetStatus(recordtask.StatusFAILED).SetErrorMessage(msg).Exec(ctx); err != nil {
+		logx.Errorf("mark record task %d failed: %v", taskID, err)
+		return
+	}
+	if err := db.Notify(ctx, dsn, db.RecordTaskChangedChannel, strconv.Itoa(taskID)); err != nil {
+		logx.Errorf("notify failed record task %d: %v", taskID, err)
+	}
 }
 
 func isNetworkSource(source string) bool {

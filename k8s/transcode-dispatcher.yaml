@@ -9,12 +9,14 @@ data:
       AutoMigrate: true
     TranscodeConf:
       BaseDir: /records
+      DisableTranscode: true
       AllowedWindow: "23:00-06:00"
       SuspendWhenRecordingActive: true
       SourceRetentionDays: 7
+      Concurrency: 1
       CPURequest: "500m"
       MemoryRequest: "512Mi"
-      MemoryLimit: "2Gi"
+      MemoryLimit: "8Gi"
     K8sJobConf:
       Namespace: rm-monitor
       Image: rm-monitor/transcode-job:latest
@@ -35,6 +37,10 @@ data:
     TranscodeConf:
       BaseDir: /records
       SourceRetentionDays: 7
+      EncoderPreset: "8"
+      EncoderParams: "lp=4"
+      VideoBitrate: "4000k"
+      AudioCodec: copy
 ---
 apiVersion: apps/v1
 kind: Deployment

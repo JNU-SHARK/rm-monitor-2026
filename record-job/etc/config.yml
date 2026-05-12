@@ -4,6 +4,6 @@ PostgresConf:
 RecordConf:
   Res: middle
   BaseDir: /records
-  PathTemplate: "{{.Event}}/{{.Zone}}/{{.MatchName}}/Round-{{.RoundNo}}/{{.Role}}.flv"
+  PathTemplate: "{{.Event}}/{{.Zone}}/{{.MatchName}}/{{.Role}}.flv"
   MatchDirTemplate: "{{.Event}}/{{.Zone}}/{{.MatchName}}"
   MatchNameTemplate: "{{.Order}}. {{.RedSchool}}-{{.RedName}} VS {{.BlueSchool}}-{{.BlueName}}"

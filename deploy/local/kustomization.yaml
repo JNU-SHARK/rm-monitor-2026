@@ -64,25 +64,6 @@ patches:
       - op: replace
         path: /spec/template/spec/containers/0/imagePullPolicy
         value: IfNotPresent
-      - op: add
-        path: /spec/template/spec/containers/0/env
-        value:
-          - name: HTTP_PROXY
-            value: http://192.168.16.3:7897
-          - name: HTTPS_PROXY
-            value: http://192.168.16.3:7897
-          - name: ALL_PROXY
-            value: http://192.168.16.3:7897
-          - name: NO_PROXY
-            value: 127.0.0.1,localhost,10.42.0.0/16,10.43.0.0/16,.svc,.cluster.local,kubernetes,kubernetes.default,kubernetes.default.svc,kubernetes.default.svc.cluster.local
-          - name: http_proxy
-            value: http://192.168.16.3:7897
-          - name: https_proxy
-            value: http://192.168.16.3:7897
-          - name: all_proxy
-            value: http://192.168.16.3:7897
-          - name: no_proxy
-            value: 127.0.0.1,localhost,10.42.0.0/16,10.43.0.0/16,.svc,.cluster.local,kubernetes,kubernetes.default,kubernetes.default.svc,kubernetes.default.svc.cluster.local
   - target:
       kind: Deployment
       name: lark-notifier
@@ -96,22 +77,6 @@ patches:
       - op: add
         path: /spec/template/spec/containers/0/env
         value:
-          - name: HTTP_PROXY
-            value: http://192.168.16.3:7897
-          - name: HTTPS_PROXY
-            value: http://192.168.16.3:7897
-          - name: ALL_PROXY
-            value: http://192.168.16.3:7897
-          - name: NO_PROXY
-            value: 127.0.0.1,localhost,10.42.0.0/16,10.43.0.0/16,.svc,.cluster.local,kubernetes,kubernetes.default,kubernetes.default.svc,kubernetes.default.svc.cluster.local
-          - name: http_proxy
-            value: http://192.168.16.3:7897
-          - name: https_proxy
-            value: http://192.168.16.3:7897
-          - name: all_proxy
-            value: http://192.168.16.3:7897
-          - name: no_proxy
-            value: 127.0.0.1,localhost,10.42.0.0/16,10.43.0.0/16,.svc,.cluster.local,kubernetes,kubernetes.default,kubernetes.default.svc,kubernetes.default.svc.cluster.local
           - name: RM_MONITOR_LARK_APP_ID
             valueFrom:
               secretKeyRef:
@@ -131,25 +96,6 @@ patches:
       - op: replace
         path: /spec/template/spec/containers/0/imagePullPolicy
         value: IfNotPresent
-      - op: add
-        path: /spec/template/spec/containers/0/env
-        value:
-          - name: HTTP_PROXY
-            value: http://192.168.16.3:7897
-          - name: HTTPS_PROXY
-            value: http://192.168.16.3:7897
-          - name: ALL_PROXY
-            value: http://192.168.16.3:7897
-          - name: NO_PROXY
-            value: 127.0.0.1,localhost,10.42.0.0/16,10.43.0.0/16,.svc,.cluster.local,kubernetes,kubernetes.default,kubernetes.default.svc,kubernetes.default.svc.cluster.local
-          - name: http_proxy
-            value: http://192.168.16.3:7897
-          - name: https_proxy
-            value: http://192.168.16.3:7897
-          - name: all_proxy
-            value: http://192.168.16.3:7897
-          - name: no_proxy
-            value: 127.0.0.1,localhost,10.42.0.0/16,10.43.0.0/16,.svc,.cluster.local,kubernetes,kubernetes.default,kubernetes.default.svc,kubernetes.default.svc.cluster.local
   - target:
       kind: Deployment
       name: transcode-dispatcher
@@ -157,25 +103,6 @@ patches:
       - op: replace
         path: /spec/template/spec/containers/0/imagePullPolicy
         value: IfNotPresent
-      - op: add
-        path: /spec/template/spec/containers/0/env
-        value:
-          - name: HTTP_PROXY
-            value: http://192.168.16.3:7897
-          - name: HTTPS_PROXY
-            value: http://192.168.16.3:7897
-          - name: ALL_PROXY
-            value: http://192.168.16.3:7897
-          - name: NO_PROXY
-            value: 127.0.0.1,localhost,10.42.0.0/16,10.43.0.0/16,.svc,.cluster.local,kubernetes,kubernetes.default,kubernetes.default.svc,kubernetes.default.svc.cluster.local
-          - name: http_proxy
-            value: http://192.168.16.3:7897
-          - name: https_proxy
-            value: http://192.168.16.3:7897
-          - name: all_proxy
-            value: http://192.168.16.3:7897
-          - name: no_proxy
-            value: 127.0.0.1,localhost,10.42.0.0/16,10.43.0.0/16,.svc,.cluster.local,kubernetes,kubernetes.default,kubernetes.default.svc,kubernetes.default.svc.cluster.local
   - target:
       kind: Deployment
       name: uploader-dispatcher
@@ -209,22 +136,6 @@ patches:
       - op: add
         path: /spec/template/spec/containers/0/env
         value:
-          - name: HTTP_PROXY
-            value: http://192.168.16.3:7897
-          - name: HTTPS_PROXY
-            value: http://192.168.16.3:7897
-          - name: ALL_PROXY
-            value: http://192.168.16.3:7897
-          - name: NO_PROXY
-            value: 127.0.0.1,localhost,10.42.0.0/16,10.43.0.0/16,.svc,.cluster.local,kubernetes,kubernetes.default,kubernetes.default.svc,kubernetes.default.svc.cluster.local
-          - name: http_proxy
-            value: http://192.168.16.3:7897
-          - name: https_proxy
-            value: http://192.168.16.3:7897
-          - name: all_proxy
-            value: http://192.168.16.3:7897
-          - name: no_proxy
-            value: 127.0.0.1,localhost,10.42.0.0/16,10.43.0.0/16,.svc,.cluster.local,kubernetes,kubernetes.default,kubernetes.default.svc,kubernetes.default.svc.cluster.local
           - name: RM_MONITOR_LARK_APP_ID
             valueFrom:
               secretKeyRef:

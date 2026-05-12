@@ -42,7 +42,7 @@ func (c *RecordConf) WithDefaults() RecordConf {
 		out.BaseDir = "/records"
 	}
 	if out.PathTemplate == "" {
-		out.PathTemplate = "{{.Event}}/{{.Zone}}/{{.MatchName}}/Round-{{.RoundNo}}/{{.Role}}.flv"
+		out.PathTemplate = "{{.Event}}/{{.Zone}}/{{.MatchName}}/{{.Role}}.flv"
 	}
 	if out.MatchDirTemplate == "" {
 		out.MatchDirTemplate = "{{.Event}}/{{.Zone}}/{{.MatchName}}"
@@ -69,13 +69,21 @@ type K8sJobConf struct {
 
 type TranscodeConf struct {
 	BaseDir                    string `json:",optional"`
+	DisableTranscode           bool   `json:",optional"`
 	AllowedWindow              string `json:",optional"`
 	SuspendWhenRecordingActive bool   `json:",optional"`
 	SourceRetentionDays        int    `json:",optional"`
+	Concurrency                int    `json:",optional"`
 	CPURequest                 string `json:",optional"`
 	CPULimit                   string `json:",optional"`
 	MemoryRequest              string `json:",optional"`
 	MemoryLimit                string `json:",optional"`
+	EncoderPreset              string `json:",optional"`
+	EncoderParams              string `json:",optional"`
+	VideoCRF                   int    `json:",optional"`
+	VideoBitrate               string `json:",optional"`
+	AudioCodec                 string `json:",optional"`
+	AudioBitrate               string `json:",optional"`
 }
 
 func (c *TranscodeConf) WithDefaults() TranscodeConf {
@@ -89,6 +97,9 @@ func (c *TranscodeConf) WithDefaults() TranscodeConf {
 	if out.SourceRetentionDays <= 0 {
 		out.SourceRetentionDays = 7
 	}
+	if out.Concurrency <= 0 {
+		out.Concurrency = 1
+	}
 	if out.CPURequest == "" {
 		out.CPURequest = "500m"
 	}
@@ -96,7 +107,22 @@ func (c *TranscodeConf) WithDefaults() TranscodeConf {
 		out.MemoryRequest = "512Mi"
 	}
 	if out.MemoryLimit == "" {
-		out.MemoryLimit = "2Gi"
+		out.MemoryLimit = "8Gi"
+	}
+	if out.EncoderPreset == "" {
+		out.EncoderPreset = "8"
+	}
+	if out.EncoderParams == "" {
+		out.EncoderParams = "lp=4"
+	}
+	if out.VideoBitrate == "" {
+		out.VideoBitrate = "4000k"
+	}
+	if out.AudioCodec == "" {
+		out.AudioCodec = "copy"
+	}
+	if out.AudioBitrate == "" {
+		out.AudioBitrate = "128k"
 	}
 	return out
 }
@@ -110,6 +136,7 @@ type UploadConf struct {
 	BaseDir                  string `json:",optional"`
 	FilePathBaseDir          string `json:",optional"`
 	LongTermBaseDir          string `json:",optional"`
+	ArtifactKind             string `json:",optional"`
 	BitableAppToken          string `json:",optional"`
 	DisableFileUpload        bool   `json:",optional"`
 	DeleteLocalAfterCopy     bool   `json:",optional"`
@@ -129,6 +156,9 @@ func (c *UploadConf) WithDefaults() UploadConf {
 	}
 	if out.FilePathBaseDir == "" {
 		out.FilePathBaseDir = out.BaseDir
+	}
+	if out.ArtifactKind == "" {
+		out.ArtifactKind = "archive"
 	}
 	if out.CopyFailureMentionName == "" {
 		out.CopyFailureMentionName = "席伟杰"

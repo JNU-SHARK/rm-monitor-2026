@@ -48,6 +48,9 @@ func (l *DispatchLogic) Tick() error {
 }
 
 func (l *DispatchLogic) createTranscodeTasks() error {
+	if l.svcCtx.Config.TranscodeConf.WithDefaults().DisableTranscode {
+		return nil
+	}
 	artifacts, err := l.svcCtx.DB.MediaArtifact.Query().
 		Where(
 			mediaartifact.KindEQ(mediaartifact.KindSource),
@@ -111,6 +114,9 @@ func (l *DispatchLogic) recoverDispatching() error {
 
 func (l *DispatchLogic) dispatchPending() error {
 	conf := l.svcCtx.Config.TranscodeConf.WithDefaults()
+	if conf.DisableTranscode {
+		return nil
+	}
 	if ok, err := inAllowedWindow(time.Now(), conf.AllowedWindow); err != nil {
 		return err
 	} else if !ok {
@@ -125,9 +131,19 @@ func (l *DispatchLogic) dispatchPending() error {
 			return nil
 		}
 	}
+	running, err := l.svcCtx.DB.TranscodeTask.Query().
+		Where(transcodetask.StatusIn(transcodetask.StatusDISPATCHING, transcodetask.StatusRUNNING)).
+		Count(l.ctx)
+	if err != nil {
+		return errors.Wrap(err, "count running transcode tasks")
+	}
+	limit := conf.Concurrency - running
+	if limit <= 0 {
+		return nil
+	}
 	tasks, err := l.svcCtx.DB.TranscodeTask.Query().
 		Where(transcodetask.StatusEQ(transcodetask.StatusPENDING)).
-		Limit(100).
+		Limit(limit).
 		All(l.ctx)
 	if err != nil {
 		return errors.Wrap(err, "query pending transcode tasks")

@@ -9,6 +9,7 @@ LarkConf:
   AppSecret: ""
 UploadConf:
   BaseDir: /records
+  ArtifactKind: source
   BitableAppToken: E2embrciuaax6sscQKwcTdHdnZf
   Concurrency: 1
 K8sJobConf:

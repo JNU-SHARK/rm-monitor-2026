@@ -3,12 +3,14 @@ PostgresConf:
   AutoMigrate: true
 TranscodeConf:
   BaseDir: /records
+  DisableTranscode: true
   AllowedWindow: "23:00-06:00"
   SuspendWhenRecordingActive: true
   SourceRetentionDays: 7
+  Concurrency: 1
   CPURequest: "500m"
   MemoryRequest: "512Mi"
-  MemoryLimit: "2Gi"
+  MemoryLimit: "8Gi"
 K8sJobConf:
   Namespace: rm-monitor
   Image: ghcr.io/scutrobotlab/rm-monitor/transcode-job:latest

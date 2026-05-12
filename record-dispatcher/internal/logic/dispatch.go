@@ -11,6 +11,7 @@ import (
 
 	"github.com/pkg/errors"
 	"scutbot.cn/web/rm-monitor/ent"
+	"scutbot.cn/web/rm-monitor/ent/match"
 	"scutbot.cn/web/rm-monitor/ent/matchround"
 	"scutbot.cn/web/rm-monitor/ent/recordtask"
 	common "scutbot.cn/web/rm-monitor/pkg/config"
@@ -30,6 +31,7 @@ type DispatchLogic struct {
 
 const dispatchingStaleAfter = 5 * time.Minute
 const manifestLookback = 30 * time.Second
+const matchStatusStarted = "STARTED"
 
 func NewDispatchLogic(ctx context.Context, svcCtx *svc.ServiceContext) *DispatchLogic {
 	return &DispatchLogic{ctx: ctx, svcCtx: svcCtx, Logger: logx.WithContext(ctx)}
@@ -54,14 +56,16 @@ func (l *DispatchLogic) Tick() error {
 func (l *DispatchLogic) cancelEndedRounds() error {
 	tasks, err := l.svcCtx.DB.RecordTask.Query().
 		Where(recordtask.StatusIn(recordtask.StatusRUNNING, recordtask.StatusDISPATCHING)).
-		WithMatchRound().
+		WithMatchRound(func(q *ent.MatchRoundQuery) {
+			q.WithMatch()
+		}).
 		Limit(200).
 		All(l.ctx)
 	if err != nil {
 		return errors.Wrap(err, "query running record tasks")
 	}
 	for _, task := range tasks {
-		if task.Edges.MatchRound != nil && task.Edges.MatchRound.Status == matchround.StatusENDED {
+		if shouldCancelRecordTask(task) {
 			if err := l.svcCtx.DB.RecordTask.UpdateOneID(task.ID).SetStatus(recordtask.StatusCANCEL_REQUESTED).Exec(l.ctx); err != nil {
 				return errors.Wrap(err, "request record cancel")
 			}
@@ -69,6 +73,17 @@ func (l *DispatchLogic) cancelEndedRounds() error {
 		}
 	}
 	return nil
+}
+
+func shouldCancelRecordTask(task *ent.RecordTask) bool {
+	round := task.Edges.MatchRound
+	if round == nil {
+		return false
+	}
+	if round.Edges.Match == nil {
+		return round.Status == matchround.StatusENDED
+	}
+	return round.Edges.Match.LatestStatus != matchStatusStarted
 }
 
 func (l *DispatchLogic) recoverDispatchingTasks() error {
@@ -115,18 +130,30 @@ func (l *DispatchLogic) createTasksForStartedRounds() error {
 		return errors.Wrap(err, "query started rounds")
 	}
 	conf := l.svcCtx.Config.RecordConf.WithDefaults()
+	handledMatches := map[string]struct{}{}
 	for _, r := range rounds {
 		m := r.Edges.Match
 		if m == nil {
 			continue
 		}
+		if _, ok := handledMatches[m.ID]; ok {
+			continue
+		}
+		handledMatches[m.ID] = struct{}{}
 		urls, err := recording.LiveURLs(l.ctx, l.svcCtx.RestyClient, conf.LiveInfoURL, m.Zone, conf.Res)
 		if err != nil {
 			l.Errorf("live urls for match %s: %v", m.ID, err)
 			continue
 		}
+		existingRoles, err := l.recordRolesForMatch(m.ID)
+		if err != nil {
+			return err
+		}
 		for role, url := range urls {
-			output, err := l.outputPath(conf, m, r.RoundNo, role)
+			if existingRoles[role] {
+				continue
+			}
+			output, err := l.outputPath(conf, m, 1, role)
 			if err != nil {
 				return err
 			}
@@ -148,6 +175,21 @@ func (l *DispatchLogic) createTasksForStartedRounds() error {
 		}
 	}
 	return nil
+}
+
+func (l *DispatchLogic) recordRolesForMatch(matchID string) (map[string]bool, error) {
+	tasks, err := l.svcCtx.DB.RecordTask.Query().
+		Where(recordtask.HasMatchRoundWith(matchround.HasMatchWith(match.ID(matchID)))).
+		Limit(200).
+		All(l.ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "query existing record tasks for match")
+	}
+	out := make(map[string]bool, len(tasks))
+	for _, task := range tasks {
+		out[task.Role] = true
+	}
+	return out, nil
 }
 
 func (l *DispatchLogic) outputPath(conf common.RecordConf, m *ent.Match, roundNo int, role string) (string, error) {

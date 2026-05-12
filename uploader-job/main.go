@@ -78,12 +78,13 @@ func run(ctx context.Context, client *ent.Client, redisClient *redisx.Client, la
 	filePath := storagepath.Resolve(uploadConf.BaseDir, task.SourcePath)
 	f, err := os.Open(filePath)
 	if err != nil {
-		_ = client.UploadTask.UpdateOneID(taskID).SetStatus(uploadtask.StatusFAILED).SetErrorMessage(err.Error()).Exec(ctx)
+		markUploadFailed(ctx, client, c.PostgresConf.DSN, taskID, err.Error())
 		return errors.Wrap(err, "open upload source")
 	}
 	defer f.Close()
 	stat, err := f.Stat()
 	if err != nil {
+		markUploadFailed(ctx, client, c.PostgresConf.DSN, taskID, err.Error())
 		return errors.Wrap(err, "stat upload source")
 	}
 
@@ -91,12 +92,13 @@ func run(ctx context.Context, client *ent.Client, redisClient *redisx.Client, la
 		return errors.Wrap(err, "mark upload running")
 	}
 	if err := waitUploadSlot(ctx, redisClient, uploadConf); err != nil {
+		markUploadFailed(ctx, client, c.PostgresConf.DSN, taskID, err.Error())
 		return err
 	}
 
 	if task.BitableAppToken == nil || task.BitableTableID == nil || task.BitableRecordID == nil {
 		err := errors.New("missing bitable upload context")
-		_ = client.UploadTask.UpdateOneID(taskID).SetStatus(uploadtask.StatusFAILED).SetErrorMessage(err.Error()).Exec(ctx)
+		markUploadFailed(ctx, client, c.PostgresConf.DSN, taskID, err.Error())
 		return err
 	}
 	name := filepath.Base(task.SourcePath)
@@ -109,17 +111,18 @@ func run(ctx context.Context, client *ent.Client, redisClient *redisx.Client, la
 			Build()).
 		Build())
 	if err != nil {
-		_ = client.UploadTask.UpdateOneID(taskID).SetStatus(uploadtask.StatusFAILED).SetErrorMessage(err.Error()).Exec(ctx)
+		markUploadFailed(ctx, client, c.PostgresConf.DSN, taskID, err.Error())
 		return errors.Wrap(err, "prepare upload")
 	}
 	if !prepareResp.Success() {
 		err := errors.Wrap(prepareResp, "prepare upload")
-		_ = client.UploadTask.UpdateOneID(taskID).SetStatus(uploadtask.StatusFAILED).SetErrorMessage(err.Error()).Exec(ctx)
+		markUploadFailed(ctx, client, c.PostgresConf.DSN, taskID, err.Error())
 		return err
 	}
 	uploadID := *prepareResp.Data.UploadId
 	for i := 0; i < *prepareResp.Data.BlockNum; i++ {
 		if err := waitUploadSlot(ctx, redisClient, uploadConf); err != nil {
+			markUploadFailed(ctx, client, c.PostgresConf.DSN, taskID, err.Error())
 			return err
 		}
 		startSize := i * *prepareResp.Data.BlockSize
@@ -130,6 +133,7 @@ func run(ctx context.Context, client *ent.Client, redisClient *redisx.Client, la
 		reader := io.NewSectionReader(f, int64(startSize), int64(endSize-startSize))
 		content, err := io.ReadAll(reader)
 		if err != nil {
+			markUploadFailed(ctx, client, c.PostgresConf.DSN, taskID, err.Error())
 			return errors.Wrap(err, "read part")
 		}
 		req := larkdrive.NewUploadPartMediaReqBuilder().Body(larkdrive.NewUploadPartMediaReqBodyBuilder().
@@ -140,11 +144,12 @@ func run(ctx context.Context, client *ent.Client, redisClient *redisx.Client, la
 			Seq(i).
 			Build()).Build()
 		if err := uploadPartWithRetry(ctx, larkClient, req, uploadConf); err != nil {
-			_ = client.UploadTask.UpdateOneID(taskID).SetStatus(uploadtask.StatusFAILED).SetErrorMessage(err.Error()).Exec(ctx)
+			markUploadFailed(ctx, client, c.PostgresConf.DSN, taskID, err.Error())
 			return err
 		}
 	}
 	if err := waitUploadSlot(ctx, redisClient, uploadConf); err != nil {
+		markUploadFailed(ctx, client, c.PostgresConf.DSN, taskID, err.Error())
 		return err
 	}
 	completeResp, err := larkClient.Drive.Media.UploadFinish(ctx, larkdrive.NewUploadFinishMediaReqBuilder().
@@ -154,17 +159,17 @@ func run(ctx context.Context, client *ent.Client, redisClient *redisx.Client, la
 			Build()).
 		Build())
 	if err != nil {
-		_ = client.UploadTask.UpdateOneID(taskID).SetStatus(uploadtask.StatusFAILED).SetErrorMessage(err.Error()).Exec(ctx)
+		markUploadFailed(ctx, client, c.PostgresConf.DSN, taskID, err.Error())
 		return errors.Wrap(err, "finish upload")
 	}
 	if !completeResp.Success() {
 		err := errors.Wrap(completeResp, "finish upload")
-		_ = client.UploadTask.UpdateOneID(taskID).SetStatus(uploadtask.StatusFAILED).SetErrorMessage(err.Error()).Exec(ctx)
+		markUploadFailed(ctx, client, c.PostgresConf.DSN, taskID, err.Error())
 		return err
 	}
 	fileToken := *completeResp.Data.FileToken
 	if err := updateBitableAttachment(ctx, larkClient, *task.BitableAppToken, *task.BitableTableID, *task.BitableRecordID, fileToken, name); err != nil {
-		_ = client.UploadTask.UpdateOneID(taskID).SetStatus(uploadtask.StatusFAILED).SetErrorMessage(err.Error()).Exec(ctx)
+		markUploadFailed(ctx, client, c.PostgresConf.DSN, taskID, err.Error())
 		return err
 	}
 	if err := client.UploadTask.UpdateOneID(taskID).
@@ -175,6 +180,16 @@ func run(ctx context.Context, client *ent.Client, redisClient *redisx.Client, la
 		return errors.Wrap(err, "mark upload succeeded")
 	}
 	return db.Notify(ctx, c.PostgresConf.DSN, db.UploadTaskChangedChannel, strconv.Itoa(taskID))
+}
+
+func markUploadFailed(ctx context.Context, client *ent.Client, dsn string, taskID int, msg string) {
+	if err := client.UploadTask.UpdateOneID(taskID).SetStatus(uploadtask.StatusFAILED).SetErrorMessage(msg).Exec(ctx); err != nil {
+		logx.Errorf("mark upload task %d failed: %v", taskID, err)
+		return
+	}
+	if err := db.Notify(ctx, dsn, db.UploadTaskChangedChannel, strconv.Itoa(taskID)); err != nil {
+		logx.Errorf("notify failed upload task %d: %v", taskID, err)
+	}
 }
 
 func waitUploadSlot(ctx context.Context, redisClient *redisx.Client, conf common.UploadConf) error {

@@ -1,0 +1,15 @@
+2026-05-12 16:52:09,501 __init__.py[line:13](Pid:957927 Tname:MainThread) ERROR Uncaught exception:
+Traceback (most recent call last):
+  File "/home/maverick/.local/bin/biliup", line 10, in <module>
+    sys.exit(arg_parser())
+  File "/home/maverick/.local/share/uv/tools/biliup/lib/python3.9/site-packages/biliup/__main__.py", line 21, in arg_parser
+    asyncio.run(main())
+  File "/home/maverick/.local/share/uv/python/cpython-3.9.22-linux-x86_64-gnu/lib/python3.9/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/home/maverick/.local/share/uv/python/cpython-3.9.22-linux-x86_64-gnu/lib/python3.9/asyncio/base_events.py", line 647, in run_until_complete
+    return future.result()
+  File "/home/maverick/.local/share/uv/tools/biliup/lib/python3.9/site-packages/biliup/__main__.py", line 33, in main
+    await loop.run_in_executor(None, stream_gears.main_loop)
+  File "/home/maverick/.local/share/uv/python/cpython-3.9.22-linux-x86_64-gnu/lib/python3.9/concurrent/futures/thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+pyo3_runtime.PanicException: failed printing to stdout: Broken pipe (os error 32)

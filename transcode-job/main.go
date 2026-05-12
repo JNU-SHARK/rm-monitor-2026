@@ -84,23 +84,38 @@ func run(ctx context.Context, client *ent.Client, c config.Config, taskID int) e
 	if err := client.TranscodeTask.UpdateOneID(taskID).SetStatus(transcodetask.StatusRUNNING).SetStartedAt(time.Now()).Exec(ctx); err != nil {
 		return errors.Wrap(err, "mark transcode running")
 	}
-	cmd := exec.CommandContext(ctx,
-		"ffmpeg",
+	args := []string{
 		"-hide_banner",
 		"-loglevel", "info",
 		"-i", sourcePath,
 		"-map", "0:v:0",
-		"-an",
+		"-map", "0:a:0?",
 		"-sn",
 		"-dn",
 		"-c:v", "libsvtav1",
-		"-preset", "8",
-		"-b:v", "1000k",
+		"-preset", transcodeConf.EncoderPreset,
+	}
+	if transcodeConf.EncoderParams != "" {
+		args = append(args, "-svtav1-params", transcodeConf.EncoderParams)
+	}
+	if transcodeConf.VideoCRF > 0 {
+		args = append(args, "-crf", strconv.Itoa(transcodeConf.VideoCRF), "-b:v", "0")
+	} else {
+		args = append(args, "-b:v", transcodeConf.VideoBitrate)
+	}
+	args = append(args,
 		"-g", "125",
 		"-pix_fmt", "yuv420p",
+		"-c:a", transcodeConf.AudioCodec,
+	)
+	if transcodeConf.AudioCodec != "copy" && transcodeConf.AudioBitrate != "" {
+		args = append(args, "-b:a", transcodeConf.AudioBitrate)
+	}
+	args = append(args,
 		"-movflags", "+faststart",
 		"-y", archivePath,
 	)
+	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 	var stderr bytes.Buffer
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = io.MultiWriter(os.Stderr, &stderr)
