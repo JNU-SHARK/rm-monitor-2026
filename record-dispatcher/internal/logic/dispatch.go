@@ -111,11 +111,13 @@ func (l *DispatchLogic) recoverDispatchingTasks() error {
 			if err := l.svcCtx.DB.RecordTask.UpdateOneID(task.ID).SetStatus(recordtask.StatusRUNNING).SetStartedAt(time.Now()).Exec(l.ctx); err != nil {
 				return errors.Wrap(err, "recover running record task")
 			}
+			l.Warnf("record task recovered task_id=%d job=%s status=RUNNING", task.ID, name)
 			continue
 		}
 		if err := l.svcCtx.DB.RecordTask.UpdateOneID(task.ID).SetStatus(recordtask.StatusPENDING).Exec(l.ctx); err != nil {
 			return errors.Wrap(err, "requeue stale record task")
 		}
+		l.Warnf("record task requeued task_id=%d missing_job=%s", task.ID, name)
 	}
 	return nil
 }
@@ -145,10 +147,12 @@ func (l *DispatchLogic) createTasksForStartedRounds() error {
 			l.Errorf("live urls for match %s: %v", m.ID, err)
 			continue
 		}
+		l.Infof("live urls fetched match_id=%s zone=%s order=%d res=%s roles=%d", m.ID, m.Zone, m.Order, conf.Res, len(urls))
 		existingRoles, err := l.recordRolesForMatch(m.ID)
 		if err != nil {
 			return err
 		}
+		created := 0
 		for role, url := range urls {
 			if existingRoles[role] {
 				continue
@@ -172,6 +176,11 @@ func (l *DispatchLogic) createTasksForStartedRounds() error {
 				}
 				return errors.Wrap(err, "create record task")
 			}
+			created++
+			l.Infof("record task created match_id=%s zone=%s order=%d role=%s output=%s", m.ID, m.Zone, m.Order, role, output)
+		}
+		if created == 0 && len(existingRoles) > 0 {
+			l.Debugf("record tasks already exist match_id=%s zone=%s order=%d roles=%d", m.ID, m.Zone, m.Order, len(existingRoles))
 		}
 	}
 	return nil
@@ -236,6 +245,7 @@ func (l *DispatchLogic) dispatchPendingTasks() error {
 		if claimed == 0 {
 			continue
 		}
+		l.Infof("record task dispatching task_id=%d job=%s", task.ID, jobName)
 		if l.svcCtx.K8s != nil {
 			job := kubejob.Build(l.svcCtx.Config.K8sJobConf, kubejob.JobSpec{
 				Name:     jobName,
@@ -248,12 +258,15 @@ func (l *DispatchLogic) dispatchPendingTasks() error {
 			})
 			if err := l.svcCtx.K8s.CreateJob(l.ctx, l.svcCtx.Config.K8sJobConf.WithDefaults().Namespace, job); err != nil {
 				_ = l.svcCtx.DB.RecordTask.UpdateOneID(task.ID).SetStatus(recordtask.StatusFAILED).SetErrorMessage(err.Error()).Exec(l.ctx)
+				l.Errorf("record job create failed task_id=%d job=%s error=%v", task.ID, jobName, err)
 				return err
 			}
+			l.Infof("record job created task_id=%d job=%s", task.ID, jobName)
 		}
 		if err := l.svcCtx.DB.RecordTask.UpdateOneID(task.ID).SetStatus(recordtask.StatusRUNNING).SetStartedAt(time.Now()).Exec(l.ctx); err != nil {
 			return errors.Wrap(err, "mark record running")
 		}
+		l.Infof("record task running task_id=%d job=%s", task.ID, jobName)
 		_ = db.Notify(l.ctx, l.svcCtx.Config.PostgresConf.DSN, db.RecordTaskChangedChannel, strconv.Itoa(task.ID))
 	}
 	return nil

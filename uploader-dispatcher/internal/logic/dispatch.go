@@ -105,6 +105,7 @@ func (l *DispatchLogic) createUploadTasks() error {
 		if err != nil {
 			return err
 		}
+		l.Infof("bitable record created artifact_id=%d match_id=%s zone=%s order=%d role=%s table=%s record=%s path=%s", artifact.ID, match.ID, match.Zone, match.Order, recordTask.Role, tableID, recordID, relativePath)
 		copyErr := l.artifactLongTermCopy(conf, artifact, relativePath)
 		needsLocalDelete := copyErr == nil && conf.DisableFileUpload && conf.LongTermBaseDir != "" && conf.DeleteLocalAfterCopy
 		create := l.svcCtx.DB.UploadTask.Create().
@@ -140,6 +141,9 @@ func (l *DispatchLogic) createUploadTasks() error {
 			_ = l.notifyCopyFailure(conf, relativePath, copyErr)
 			continue
 		}
+		if conf.LongTermBaseDir != "" {
+			l.Infof("artifact long-term copy succeeded path=%s target_base=%s", relativePath, conf.LongTermBaseDir)
+		}
 		if needsLocalDelete {
 			if err := l.deleteLocalArtifacts(conf.BaseDir, artifact); err != nil {
 				deleteErr := errors.Wrapf(err, "delete local artifacts after long-term copy %s", relativePath)
@@ -151,6 +155,7 @@ func (l *DispatchLogic) createUploadTasks() error {
 				_ = l.notifyCopyFailure(conf, relativePath, deleteErr)
 				continue
 			}
+			l.Infof("local artifacts deleted after copy path=%s", relativePath)
 			if err := l.svcCtx.DB.UploadTask.UpdateOneID(id).
 				SetStatus(uploadtask.StatusSUCCEEDED).
 				SetCompletedAt(time.Now()).
@@ -159,6 +164,7 @@ func (l *DispatchLogic) createUploadTasks() error {
 			}
 		}
 		if conf.DisableFileUpload {
+			l.Infof("upload task completed without file upload task_id=%d artifact_id=%d path=%s", id, artifact.ID, relativePath)
 			_ = db.Notify(l.ctx, l.svcCtx.Config.PostgresConf.DSN, db.UploadTaskChangedChannel, strconv.Itoa(id))
 		}
 	}
@@ -743,11 +749,13 @@ func (l *DispatchLogic) recoverDispatching() error {
 			if err := l.svcCtx.DB.UploadTask.UpdateOneID(task.ID).SetStatus(uploadtask.StatusRUNNING).SetStartedAt(time.Now()).Exec(l.ctx); err != nil {
 				return errors.Wrap(err, "recover running upload task")
 			}
+			l.Warnf("upload task recovered task_id=%d job=%s status=RUNNING", task.ID, name)
 			continue
 		}
 		if err := l.svcCtx.DB.UploadTask.UpdateOneID(task.ID).SetStatus(uploadtask.StatusPENDING).Exec(l.ctx); err != nil {
 			return errors.Wrap(err, "requeue stale upload task")
 		}
+		l.Warnf("upload task requeued task_id=%d missing_job=%s", task.ID, name)
 	}
 	return nil
 }
@@ -783,6 +791,7 @@ func (l *DispatchLogic) dispatchPending() error {
 		if claimed == 0 {
 			continue
 		}
+		l.Infof("upload task dispatching task_id=%d job=%s", task.ID, jobName)
 		if l.svcCtx.K8s != nil {
 			job := kubejob.Build(l.svcCtx.Config.K8sJobConf, kubejob.JobSpec{
 				Name:     jobName,
@@ -795,12 +804,15 @@ func (l *DispatchLogic) dispatchPending() error {
 			})
 			if err := l.svcCtx.K8s.CreateJob(l.ctx, l.svcCtx.Config.K8sJobConf.WithDefaults().Namespace, job); err != nil {
 				_ = l.svcCtx.DB.UploadTask.UpdateOneID(task.ID).SetStatus(uploadtask.StatusFAILED).SetErrorMessage(err.Error()).Exec(l.ctx)
+				l.Errorf("upload job create failed task_id=%d job=%s error=%v", task.ID, jobName, err)
 				return err
 			}
+			l.Infof("upload job created task_id=%d job=%s", task.ID, jobName)
 		}
 		if err := l.svcCtx.DB.UploadTask.UpdateOneID(task.ID).SetStatus(uploadtask.StatusRUNNING).SetStartedAt(time.Now()).Exec(l.ctx); err != nil {
 			return errors.Wrap(err, "mark upload running")
 		}
+		l.Infof("upload task running task_id=%d job=%s", task.ID, jobName)
 	}
 	return nil
 }

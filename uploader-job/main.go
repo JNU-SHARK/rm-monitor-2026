@@ -91,6 +91,7 @@ func run(ctx context.Context, client *ent.Client, redisClient *redisx.Client, la
 	if err := client.UploadTask.UpdateOneID(taskID).SetStatus(uploadtask.StatusRUNNING).SetStartedAt(time.Now()).Exec(ctx); err != nil {
 		return errors.Wrap(err, "mark upload running")
 	}
+	logx.Infof("upload task started task_id=%d source=%s size=%d", taskID, task.SourcePath, stat.Size())
 	if err := waitUploadSlot(ctx, redisClient, uploadConf); err != nil {
 		markUploadFailed(ctx, client, c.PostgresConf.DSN, taskID, err.Error())
 		return err
@@ -120,6 +121,7 @@ func run(ctx context.Context, client *ent.Client, redisClient *redisx.Client, la
 		return err
 	}
 	uploadID := *prepareResp.Data.UploadId
+	logx.Infof("upload prepared task_id=%d blocks=%d block_size=%d", taskID, *prepareResp.Data.BlockNum, *prepareResp.Data.BlockSize)
 	for i := 0; i < *prepareResp.Data.BlockNum; i++ {
 		if err := waitUploadSlot(ctx, redisClient, uploadConf); err != nil {
 			markUploadFailed(ctx, client, c.PostgresConf.DSN, taskID, err.Error())
@@ -147,6 +149,7 @@ func run(ctx context.Context, client *ent.Client, redisClient *redisx.Client, la
 			markUploadFailed(ctx, client, c.PostgresConf.DSN, taskID, err.Error())
 			return err
 		}
+		logx.Debugf("upload part succeeded task_id=%d seq=%d size=%d", taskID, i, endSize-startSize)
 	}
 	if err := waitUploadSlot(ctx, redisClient, uploadConf); err != nil {
 		markUploadFailed(ctx, client, c.PostgresConf.DSN, taskID, err.Error())
@@ -179,10 +182,12 @@ func run(ctx context.Context, client *ent.Client, redisClient *redisx.Client, la
 		Exec(ctx); err != nil {
 		return errors.Wrap(err, "mark upload succeeded")
 	}
+	logx.Infof("upload task succeeded task_id=%d file_token=%s record=%s source=%s", taskID, fileToken, *task.BitableRecordID, task.SourcePath)
 	return db.Notify(ctx, c.PostgresConf.DSN, db.UploadTaskChangedChannel, strconv.Itoa(taskID))
 }
 
 func markUploadFailed(ctx context.Context, client *ent.Client, dsn string, taskID int, msg string) {
+	logx.Errorf("upload task failed task_id=%d error=%s", taskID, msg)
 	if err := client.UploadTask.UpdateOneID(taskID).SetStatus(uploadtask.StatusFAILED).SetErrorMessage(msg).Exec(ctx); err != nil {
 		logx.Errorf("mark upload task %d failed: %v", taskID, err)
 		return

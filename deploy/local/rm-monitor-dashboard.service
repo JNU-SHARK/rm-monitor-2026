@@ -1,0 +1,19 @@
+[Unit]
+Description=RM Monitor local dashboard
+After=network-online.target k3s.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=maverick
+Group=maverick
+WorkingDirectory=/home/maverick/RM/rm-monitor-2026
+Environment=HOME=/home/maverick
+Environment=KUBECONFIG=/home/maverick/.kube/config
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/bin/python3 deploy/local/dashboard.py --host 0.0.0.0 --port 18080
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

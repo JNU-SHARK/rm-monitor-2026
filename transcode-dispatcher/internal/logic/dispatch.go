@@ -74,6 +74,7 @@ func (l *DispatchLogic) createTranscodeTasks() error {
 			}
 			return errors.Wrap(err, "create transcode task")
 		}
+		l.Infof("transcode task created source_artifact=%d path=%s", artifact.ID, artifact.Path)
 	}
 	return nil
 }
@@ -103,11 +104,13 @@ func (l *DispatchLogic) recoverDispatching() error {
 			if err := l.svcCtx.DB.TranscodeTask.UpdateOneID(task.ID).SetStatus(transcodetask.StatusRUNNING).SetStartedAt(time.Now()).Exec(l.ctx); err != nil {
 				return errors.Wrap(err, "recover running transcode task")
 			}
+			l.Warnf("transcode task recovered task_id=%d job=%s status=RUNNING", task.ID, name)
 			continue
 		}
 		if err := l.svcCtx.DB.TranscodeTask.UpdateOneID(task.ID).SetStatus(transcodetask.StatusPENDING).Exec(l.ctx); err != nil {
 			return errors.Wrap(err, "requeue stale transcode task")
 		}
+		l.Warnf("transcode task requeued task_id=%d missing_job=%s", task.ID, name)
 	}
 	return nil
 }
@@ -163,6 +166,7 @@ func (l *DispatchLogic) dispatchPending() error {
 		if claimed == 0 {
 			continue
 		}
+		l.Infof("transcode task dispatching task_id=%d job=%s", task.ID, jobName)
 		if l.svcCtx.K8s != nil {
 			job := kubejob.Build(l.svcCtx.Config.K8sJobConf, kubejob.JobSpec{
 				Name:     jobName,
@@ -177,12 +181,15 @@ func (l *DispatchLogic) dispatchPending() error {
 			})
 			if err := l.svcCtx.K8s.CreateJob(l.ctx, jobConf.Namespace, job); err != nil {
 				_ = l.svcCtx.DB.TranscodeTask.UpdateOneID(task.ID).SetStatus(transcodetask.StatusFAILED).SetErrorMessage(err.Error()).Exec(l.ctx)
+				l.Errorf("transcode job create failed task_id=%d job=%s error=%v", task.ID, jobName, err)
 				return err
 			}
+			l.Infof("transcode job created task_id=%d job=%s", task.ID, jobName)
 		}
 		if err := l.svcCtx.DB.TranscodeTask.UpdateOneID(task.ID).SetStatus(transcodetask.StatusRUNNING).SetStartedAt(time.Now()).Exec(l.ctx); err != nil {
 			return errors.Wrap(err, "mark transcode running")
 		}
+		l.Infof("transcode task running task_id=%d job=%s", task.ID, jobName)
 	}
 	return nil
 }
@@ -246,6 +253,7 @@ func (l *DispatchLogic) cleanupExpiredSources() error {
 			Exec(l.ctx); err != nil {
 			return errors.Wrap(err, "mark source deleted")
 		}
+		l.Infof("source artifact deleted artifact_id=%d path=%s", artifact.ID, artifact.Path)
 	}
 	return nil
 }

@@ -9,6 +9,8 @@ import time
 import urllib.request
 from pathlib import Path
 
+import local_log
+
 
 DEFAULT_LIVE_INFO_URL = "https://rm-static.djicdn.com/live_json/live_game_info.json"
 DEFAULT_OUTPUT_ROOT = "/mnt/PC801/rm-monitor/emergency"
@@ -73,6 +75,17 @@ def main() -> int:
         )
 
     print(json.dumps({"output_dir": str(output_dir), "roles": [role for role, _ in roles]}, ensure_ascii=False, indent=2))
+    local_log.log_event(
+        "emergency-record",
+        "INFO",
+        "emergency recorder plan ready",
+        zone=args.zone,
+        res=args.res,
+        output_dir=str(output_dir),
+        roles=len(roles),
+        dry_run=args.dry_run,
+        duration=args.duration,
+    )
     if args.dry_run:
         for command in commands:
             print(shell_join(command))
@@ -98,6 +111,13 @@ def main() -> int:
         log_path = output_dir / (Path(command[-1]).stem + ".log")
         log_file = log_path.open("ab")
         processes.append(subprocess.Popen(command, stdout=log_file, stderr=subprocess.STDOUT))
+    local_log.log_event(
+        "emergency-record",
+        "INFO",
+        "emergency recorders started",
+        output_dir=str(output_dir),
+        roles=len(roles),
+    )
 
     deadline = time.monotonic() + args.duration if args.duration > 0 else None
     while True:
@@ -111,7 +131,16 @@ def main() -> int:
     failed = [p.returncode for p in processes if p.returncode not in (0, 255, -2)]
     if failed:
         print(f"{len(failed)} recorder process(es) exited unexpectedly", file=sys.stderr)
+        local_log.log_event(
+            "emergency-record",
+            "ERROR",
+            "recorder process exited unexpectedly",
+            output_dir=str(output_dir),
+            failed=len(failed),
+            return_codes=failed,
+        )
         return 1
+    local_log.log_event("emergency-record", "INFO", "emergency recorders completed", output_dir=str(output_dir))
     return 0
 
 
@@ -144,4 +173,4 @@ def shell_join(command: list[str]) -> str:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(local_log.run_logged("emergency-record", main))

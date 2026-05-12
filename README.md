@@ -39,6 +39,58 @@ kubectl get jobs -n rm-monitor
 kubectl get pv,pvc -n rm-monitor
 ```
 
+## Dashboard 看板与日志
+
+本机只读 dashboard：
+
+```sh
+python3 deploy/local/dashboard.py --host 0.0.0.0 --port 18080
+```
+
+已安装为 systemd 服务时：
+
+```sh
+sudo systemctl status rm-monitor-dashboard.service
+sudo systemctl restart rm-monitor-dashboard.service
+```
+
+访问地址：
+
+```sh
+http://127.0.0.1:18080
+http://192.168.16.3:18080
+```
+
+局域网访问已通过 UFW 仅向 `192.168.16.0/24` 开放 `enp5s0:18080/tcp`。dashboard 不写业务数据库，不创建任务；它只读取 Kubernetes 日志、Pod/Job/Deployment 状态、Postgres 任务状态、存储容量、官方赛程/直播接口，以及本机脚本日志。
+
+首页按值班视角展示红/黄/绿状态，默认筛选“今天”：
+
+- 总判断：当前是否需要立即处理。
+- 当前状态：服务运行、官方直播、自动录制、Bili 上传、存储空间、告警信号；日志信号只按最近 15 分钟参与当前判断。
+- 需要处理：只列当前要看的问题。
+- 今日累计：录制/上传/转码任务数、源文件数量和体量、脚本事件、当天日志采样数量。默认排除名称包含“测试”的比赛任务，避免测试污染正式值班视图。
+- 诊断详情：默认折叠，排障时再看分布和原始日志。
+
+异常面板会显示这些问题：
+
+- Deployment 未就绪、Pod 非 Running/Succeeded、容器重启、Job 失败。
+- 最近 24 小时内非测试比赛的录制、转码、上传任务失败。
+- 比赛已 STARTED 但没有录制任务。
+- `/mnt/PC801` 或 `/mnt/server_data` 容量接近或达到危险线。
+- 官方赛程或直播接口不可访问。
+- 本机 `biliup` 上传、长期归档、应急录制脚本出现 ERROR/WARN。
+- 当前筛选范围内的 ERROR/WARN 日志。
+
+本机脚本日志默认写入：
+
+```sh
+logs/biliup-upload.log
+logs/archive-artifacts.log
+logs/emergency-record.log
+```
+
+每行是 JSON，便于 dashboard 解析。`download.log` 和 `ds_update.log` 也会作为只读日志源出现在 dashboard 中。
+
 ## 数据目录
 
 录制源文件目录：
@@ -177,7 +229,9 @@ kubectl exec -n rm-monitor deployment/uploader-dispatcher -- df -h /server-data
 - `/etc/fstab.rm-monitor-*.bak` 备份文件
 - systemd 服务：`rm-monitor-container-net-bypass.service`
 - systemd 服务：`rm-monitor-proxy-relay.service`
+- systemd 服务：`rm-monitor-dashboard.service`
 - systemd drop-in：`/etc/systemd/system/clash-verge-service.service.d/rm-monitor-container-net-bypass.conf`
+- UFW 规则：`18080/tcp on enp5s0 ALLOW IN 192.168.16.0/24`
 - 路由规则：`ip rule show` 中 `pref 8998` 的容器网段规则
 - Bilibili 登录态：`cookies.json`
 - 本地日志：`download.log`、`ds_update.log`
@@ -204,11 +258,19 @@ kubectl delete pv rm-monitor-records --ignore-not-found=true
 
 ```sh
 sudo systemctl disable --now rm-monitor-container-net-bypass.service
+sudo systemctl disable --now rm-monitor-dashboard.service
 sudo rm -f /etc/systemd/system/rm-monitor-container-net-bypass.service
+sudo rm -f /etc/systemd/system/rm-monitor-dashboard.service
 sudo rm -f /usr/local/sbin/rm-monitor-container-net-bypass
 sudo rm -f /etc/systemd/system/clash-verge-service.service.d/rm-monitor-container-net-bypass.conf
 sudo rmdir --ignore-fail-on-non-empty /etc/systemd/system/clash-verge-service.service.d
 sudo systemctl daemon-reload
+```
+
+如不再需要局域网 dashboard 访问，删除 UFW 规则：
+
+```sh
+sudo ufw delete allow in on enp5s0 from 192.168.16.0/24 to any port 18080 proto tcp
 ```
 
 7. 删除容器直连路由规则：

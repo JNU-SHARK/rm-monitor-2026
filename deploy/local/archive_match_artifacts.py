@@ -9,6 +9,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import local_log
+
 
 DEFAULT_SOURCE_ROOT = "/mnt/PC801/rm-monitor/records"
 DEFAULT_TARGET_ROOT = "/mnt/server_data/rm-monitor/records"
@@ -43,6 +45,19 @@ def main() -> int:
         raise SystemExit("no available source artifacts matched")
 
     print(f"artifacts={len(artifacts)}")
+    local_log.log_event(
+        "archive-artifacts",
+        "INFO",
+        "archive plan ready",
+        submit=args.submit,
+        match_id=args.match_id,
+        zone=args.zone,
+        order=args.order,
+        artifacts=len(artifacts),
+        source_root=args.source_root,
+        target_root=args.target_root,
+        delete_source=args.delete_source,
+    )
     for artifact in artifacts:
         source = resolve(Path(args.source_root), artifact.rel_path)
         target = resolve(Path(args.target_root), artifact.rel_path)
@@ -57,14 +72,41 @@ def main() -> int:
     for artifact in artifacts:
         source = resolve(Path(args.source_root), artifact.rel_path)
         target = resolve(Path(args.target_root), artifact.rel_path)
+        local_log.log_event(
+            "archive-artifacts",
+            "INFO",
+            "copy started",
+            artifact_id=artifact.artifact_id,
+            role=artifact.role,
+            source=str(source),
+            target=str(target),
+        )
         copy_verified(source, target, artifact)
         copied += 1
+        local_log.log_event(
+            "archive-artifacts",
+            "INFO",
+            "copy verified",
+            artifact_id=artifact.artifact_id,
+            role=artifact.role,
+            target=str(target),
+            size=artifact.size,
+        )
         if args.delete_source:
             if source.exists():
                 source.unlink()
             psql_exec(args, f"update media_artifacts set status='DELETED', deleted_at=now(), updated_at=now() where id={artifact.artifact_id};")
             deleted += 1
+            local_log.log_event(
+                "archive-artifacts",
+                "INFO",
+                "source deleted after archive",
+                artifact_id=artifact.artifact_id,
+                role=artifact.role,
+                source=str(source),
+            )
     print(f"verified={copied} deleted={deleted}")
+    local_log.log_event("archive-artifacts", "INFO", "archive completed", copied=copied, deleted=deleted)
     return 0
 
 
@@ -170,4 +212,4 @@ def sql_escape(value: str) -> str:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(local_log.run_logged("archive-artifacts", main))

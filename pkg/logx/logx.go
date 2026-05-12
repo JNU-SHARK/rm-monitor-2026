@@ -35,6 +35,10 @@ func Info(args ...any) {
 	slog.Default().Info(fmt.Sprint(args...))
 }
 
+func Warn(args ...any) {
+	slog.Default().Warn(fmt.Sprint(args...))
+}
+
 func Error(args ...any) {
 	slog.Default().Error(fmt.Sprint(args...))
 }
@@ -47,6 +51,10 @@ func Infof(format string, args ...any) {
 	slog.Default().Info(fmt.Sprintf(format, args...))
 }
 
+func Warnf(format string, args ...any) {
+	slog.Default().Warn(fmt.Sprintf(format, args...))
+}
+
 func Errorf(format string, args ...any) {
 	slog.Default().Error(fmt.Sprintf(format, args...))
 }
@@ -57,6 +65,10 @@ func (l Logger) Debugf(format string, args ...any) {
 
 func (l Logger) Infof(format string, args ...any) {
 	slog.Default().InfoContext(l.ctx, fmt.Sprintf(format, args...))
+}
+
+func (l Logger) Warnf(format string, args ...any) {
+	slog.Default().WarnContext(l.ctx, fmt.Sprintf(format, args...))
 }
 
 func (l Logger) Errorf(format string, args ...any) {

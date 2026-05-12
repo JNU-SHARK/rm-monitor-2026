@@ -171,9 +171,34 @@ func (l *MatchScanLogic) upsertMatch(m scannedMatch) error {
 	}
 
 	if ok {
+		if prev.Status != m.Status {
+			l.Infof(
+				"match status changed match_id=%s zone=%s order=%d stage=%s old_status=%s new_status=%s score=%d:%d",
+				m.ID,
+				m.Zone,
+				m.Order,
+				stageLabel(m),
+				prev.Status,
+				m.Status,
+				m.RedWinGameCount,
+				m.BlueWinGameCount,
+			)
+		} else if prev.RedWinGameCount != m.RedWinGameCount || prev.BlueWinGameCount != m.BlueWinGameCount {
+			l.Infof(
+				"match score changed match_id=%s zone=%s order=%d status=%s score=%d:%d",
+				m.ID,
+				m.Zone,
+				m.Order,
+				m.Status,
+				m.RedWinGameCount,
+				m.BlueWinGameCount,
+			)
+		}
 		if err := l.reconcileRounds(prev, m); err != nil {
 			return err
 		}
+	} else {
+		l.Infof("match discovered match_id=%s zone=%s order=%d stage=%s status=%s", m.ID, m.Zone, m.Order, stageLabel(m), m.Status)
 	}
 	return l.saveLastProcessed(m)
 }
@@ -243,6 +268,7 @@ func (l *MatchScanLogic) ensureStartedRound(m scannedMatch, roundNo int) error {
 		}
 		return errors.Wrap(err, "create match round")
 	}
+	l.Infof("match round started match_id=%s zone=%s order=%d round=%d", m.ID, m.Zone, m.Order, roundNo)
 	return db.Notify(l.ctx, l.svcCtx.Config.PostgresConf.DSN, db.MatchRoundChangedChannel, strconv.Itoa(created.ID))
 }
 
@@ -271,6 +297,7 @@ func (l *MatchScanLogic) ensureEndedRound(matchID string, roundNo int, winner ma
 			}
 			return errors.Wrap(err, "create ended round")
 		}
+		l.Infof("match round ended match_id=%s round=%d winner=%s", matchID, roundNo, winner)
 		return db.Notify(l.ctx, l.svcCtx.Config.PostgresConf.DSN, db.MatchRoundChangedChannel, strconv.Itoa(created.ID))
 	}
 	if r.Status == matchround.StatusENDED {
@@ -283,6 +310,7 @@ func (l *MatchScanLogic) ensureEndedRound(matchID string, roundNo int, winner ma
 		Exec(l.ctx); err != nil {
 		return errors.Wrap(err, "end round")
 	}
+	l.Infof("match round ended match_id=%s round=%d winner=%s", matchID, roundNo, winner)
 	return db.Notify(l.ctx, l.svcCtx.Config.PostgresConf.DSN, db.MatchRoundChangedChannel, strconv.Itoa(r.ID))
 }
 
@@ -317,6 +345,16 @@ func (l *MatchScanLogic) saveLastProcessed(m scannedMatch) error {
 
 func lastProcessedKey(matchID string) string {
 	return fmt.Sprintf("rm-monitor:monitor:last_processed:%s", matchID)
+}
+
+func stageLabel(m scannedMatch) string {
+	if m.MatchSlug != "" {
+		return m.MatchSlug
+	}
+	if m.MatchType != "" {
+		return m.MatchType
+	}
+	return "unknown"
 }
 
 func winnersFromDelta(prev processedSnapshot, cur scannedMatch, count int) []matchround.Winner {

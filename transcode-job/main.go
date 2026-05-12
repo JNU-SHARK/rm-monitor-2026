@@ -84,6 +84,7 @@ func run(ctx context.Context, client *ent.Client, c config.Config, taskID int) e
 	if err := client.TranscodeTask.UpdateOneID(taskID).SetStatus(transcodetask.StatusRUNNING).SetStartedAt(time.Now()).Exec(ctx); err != nil {
 		return errors.Wrap(err, "mark transcode running")
 	}
+	logx.Infof("transcode task started task_id=%d source_artifact=%d source=%s output=%s", taskID, source.ID, source.Path, archiveRel)
 	args := []string{
 		"-hide_banner",
 		"-loglevel", "info",
@@ -123,6 +124,7 @@ func run(ctx context.Context, client *ent.Client, c config.Config, taskID int) e
 	if err := cmd.Run(); err != nil {
 		msg := commandError(err, stderr.String())
 		_ = client.TranscodeTask.UpdateOneID(taskID).SetStatus(transcodetask.StatusFAILED).SetErrorMessage(msg).Exec(ctx)
+		logx.Errorf("transcode task failed task_id=%d error=%s", taskID, msg)
 		return errors.New(msg)
 	}
 	stat, err := os.Stat(archivePath)
@@ -173,6 +175,7 @@ func run(ctx context.Context, client *ent.Client, c config.Config, taskID int) e
 		Exec(ctx); err != nil {
 		return errors.Wrap(err, "mark transcode succeeded")
 	}
+	logx.Infof("transcode task succeeded task_id=%d archive_artifact=%d size=%d checksum=%s output=%s", taskID, archive.ID, stat.Size(), sum, archiveRel)
 	return db.Notify(ctx, c.PostgresConf.DSN, db.TranscodeTaskChangedChannel, strconv.Itoa(taskID))
 }
 

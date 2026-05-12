@@ -15,6 +15,8 @@ from urllib.parse import quote
 
 import requests
 
+import local_log
+
 
 DEFAULT_RECORDS_ROOT = "/mnt/PC801/rm-monitor/records"
 DEFAULT_ARCHIVE_TARGET_ROOT = "/mnt/server_data/rm-monitor/records"
@@ -137,6 +139,19 @@ def main() -> int:
     parser.add_argument("--submit", action="store_true", help="Actually run biliup. Without this, only print the plan.")
     parser.add_argument("--allow-duplicates", action="store_true", help="Allow multiple files with the same role.")
     args = parser.parse_args()
+    local_log.log_event(
+        "biliup-upload",
+        "INFO",
+        "biliup workflow selected",
+        submit=args.submit,
+        match_id=args.match_id,
+        zone=args.zone,
+        order=args.order,
+        add_existing_bvid=args.add_existing_bvid or "",
+        archive_after_upload=not args.no_archive_after_upload,
+        feishu_link=not args.no_feishu_link,
+        feishu_topic_reply=not args.no_feishu_topic_reply,
+    )
 
     session, csrf = load_bili_session(Path(args.cookie))
     season = None if args.no_season else resolve_season(session, args)
@@ -177,6 +192,16 @@ def main() -> int:
                 indent=2,
             )
         )
+        local_log.log_event(
+            "biliup-upload",
+            "INFO",
+            "existing BVID plan ready",
+            bvid=args.add_existing_bvid,
+            submit=args.submit,
+            match_id="" if match_info is None else match_info.match_id,
+            season="" if season is None else season.title,
+            artifacts=len(artifacts),
+        )
         if args.submit:
             archive = load_archive_detail(args, args.add_existing_bvid)
             add_archive_to_season(session, csrf, season, archive)
@@ -208,6 +233,13 @@ def main() -> int:
                 reply_feishu_bilibili_link(args, match_info, args.add_existing_bvid)
             if match_info is not None and not args.no_archive_after_upload:
                 archive_after_upload(args, match_info)
+            local_log.log_event(
+                "biliup-upload",
+                "INFO",
+                "existing BVID workflow completed",
+                bvid=args.add_existing_bvid,
+                match_id="" if match_info is None else match_info.match_id,
+            )
         return 0
 
     match_info = load_match(args)
@@ -242,6 +274,16 @@ def main() -> int:
     print(json.dumps(plan, ensure_ascii=False, indent=2))
     print()
     print(shell_join(command))
+    local_log.log_event(
+        "biliup-upload",
+        "INFO",
+        "biliup upload plan ready",
+        submit=args.submit,
+        match_id=match_info.match_id,
+        title=title,
+        videos=len(video_paths),
+        season="" if season is None else season.title,
+    )
 
     if not args.submit:
         return 0
@@ -264,8 +306,24 @@ def main() -> int:
             )
 
     before = set(find_bvids_by_title(session, title))
+    local_log.log_event(
+        "biliup-upload",
+        "INFO",
+        "biliup upload started",
+        match_id=match_info.match_id,
+        title=title,
+        videos=len(video_paths),
+    )
     code, upload_output = run_streaming(command)
     if code != 0:
+        local_log.log_event(
+            "biliup-upload",
+            "ERROR",
+            "biliup upload failed",
+            match_id=match_info.match_id,
+            title=title,
+            exit_code=code,
+        )
         send_feishu_alert(
             args,
             "Bilibili 上传失败",
@@ -295,6 +353,14 @@ def main() -> int:
         reply_feishu_bilibili_link(args, match_info, bvid)
     if not args.no_archive_after_upload:
         archive_after_upload(args, match_info)
+    local_log.log_event(
+        "biliup-upload",
+        "INFO",
+        "biliup upload workflow completed",
+        match_id=match_info.match_id,
+        title=title,
+        bvid=bvid,
+    )
     return 0
 
 
@@ -522,14 +588,39 @@ def archive_after_upload(args: argparse.Namespace, match_info: MatchInfo) -> Non
     if not args.keep_source_after_archive:
         command.append("--delete-source")
     print("post-upload archive:", shell_join(command), file=sys.stderr)
+    local_log.log_event(
+        "biliup-upload",
+        "INFO",
+        "post-upload archive started",
+        match_id=match_info.match_id,
+        source_root=args.archive_source_root or args.records_root,
+        target_root=args.archive_target_root,
+        delete_source=not args.keep_source_after_archive,
+    )
     code, _ = run_streaming(command)
     if code != 0:
+        local_log.log_event(
+            "biliup-upload",
+            "ERROR",
+            "post-upload archive failed",
+            match_id=match_info.match_id,
+            exit_code=code,
+            source_root=args.archive_source_root or args.records_root,
+            target_root=args.archive_target_root,
+        )
         send_feishu_alert(
             args,
             "长期归档失败",
             f"比赛：{match_info.zone} 第{match_info.order}场\n返回码：{code}\n请立即提醒席伟杰修复。源文件仍在 {args.archive_source_root or args.records_root}",
         )
         raise SystemExit(code)
+    local_log.log_event(
+        "biliup-upload",
+        "INFO",
+        "post-upload archive completed",
+        match_id=match_info.match_id,
+        target_root=args.archive_target_root,
+    )
 
 
 def load_bili_session(cookie_path: Path) -> tuple[requests.Session, str]:
@@ -1123,7 +1214,4 @@ def shell_join(command: list[str]) -> str:
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except KeyboardInterrupt:
-        raise SystemExit(130)
+    raise SystemExit(local_log.run_logged("biliup-upload", main))

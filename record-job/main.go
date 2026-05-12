@@ -79,6 +79,7 @@ func run(ctx context.Context, client *ent.Client, c config.Config, taskID int) e
 	if err := client.RecordTask.UpdateOneID(taskID).SetStatus(recordtask.StatusRUNNING).SetStartedAt(time.Now()).Exec(ctx); err != nil {
 		return errors.Wrap(err, "mark running")
 	}
+	logx.Infof("record task started task_id=%d role=%s output=%s", taskID, task.Role, path.Clean(task.OutputPath))
 
 	args := []string{
 		"-hide_banner",
@@ -115,10 +116,11 @@ func run(ctx context.Context, client *ent.Client, c config.Config, taskID int) e
 		return cmd.Process.Signal(os.Interrupt)
 	}
 	cmd.WaitDelay = 10 * time.Second
-	logx.Infof("recording %s to %s", task.SourceURL, path.Clean(task.OutputPath))
+	logx.Infof("record ffmpeg started task_id=%d role=%s network_source=%t", taskID, task.Role, isNetworkSource(task.SourceURL))
 	err = cmd.Run()
 	if jobCtx.Err() != nil && !stopRequested.Load() {
 		_ = client.RecordTask.UpdateOneID(taskID).SetStatus(recordtask.StatusCANCELED).SetErrorMessage(jobCtx.Err().Error()).Exec(ctx)
+		logx.Warnf("record task canceled by context task_id=%d error=%v", taskID, jobCtx.Err())
 		return jobCtx.Err()
 	}
 	if err != nil && !stopRequested.Load() {
@@ -150,10 +152,12 @@ func run(ctx context.Context, client *ent.Client, c config.Config, taskID int) e
 		markRecordFailed(ctx, client, c.PostgresConf.DSN, taskID, err.Error())
 		return errors.Wrap(err, "upsert source artifact")
 	}
+	logx.Infof("record task succeeded task_id=%d role=%s size=%d checksum=%s output=%s", taskID, task.Role, stat.Size(), sum, path.Clean(task.OutputPath))
 	return db.Notify(ctx, c.PostgresConf.DSN, db.RecordTaskChangedChannel, strconv.Itoa(taskID))
 }
 
 func markRecordFailed(ctx context.Context, client *ent.Client, dsn string, taskID int, msg string) {
+	logx.Errorf("record task failed task_id=%d error=%s", taskID, msg)
 	if err := client.RecordTask.UpdateOneID(taskID).SetStatus(recordtask.StatusFAILED).SetErrorMessage(msg).Exec(ctx); err != nil {
 		logx.Errorf("mark record task %d failed: %v", taskID, err)
 		return
@@ -219,6 +223,7 @@ func watchCancel(ctx context.Context, client *ent.Client, taskID int, stopReques
 			task, err := client.RecordTask.Get(ctx, taskID)
 			if err == nil && task.Status == recordtask.StatusCANCEL_REQUESTED {
 				stopRequested.Store(true)
+				logx.Warnf("record task stop requested task_id=%d", taskID)
 				cancel()
 				return
 			}

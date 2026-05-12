@@ -30,3 +30,6 @@ build
 .local-bin/
 recorder/data
 data/
+logs/
+__pycache__/
+*.py[cod]
