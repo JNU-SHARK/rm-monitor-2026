@@ -376,6 +376,15 @@ def main() -> int:
     if season is not None or not args.no_feishu_link or not args.no_feishu_topic_reply:
         bvid = wait_for_new_bvid(session, title, before, find_bvid_in_text(upload_output))
         archive = load_archive_detail(args, bvid)
+        local_log.log_event(
+            "biliup-upload",
+            "INFO",
+            "biliup submit completed",
+            match_id=match_info.match_id,
+            title=title,
+            bvid=bvid,
+            bili_submit=args.bili_submit,
+        )
     if season is not None:
         add_archive_to_season(session, csrf, season, archive)
         print(f"added {bvid} to {season.title} / {season.section_title}", file=sys.stderr)

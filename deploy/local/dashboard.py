@@ -757,7 +757,7 @@ def upload_pipeline_step(matches_by_id: dict[str, dict]) -> dict:
     completions = [
         item
         for item in events
-        if event_message(item) in ("biliup upload workflow completed", "existing BVID workflow completed")
+        if event_message(item) in ("biliup submit completed", "biliup upload workflow completed", "existing BVID workflow completed")
     ]
     failures = [
         item
@@ -848,46 +848,111 @@ def latest_queue_status(path: Path, matches_by_id: dict[str, dict]) -> dict | No
 
 def archive_artifact_status(matches_by_id: dict[str, dict]) -> dict | None:
     events = read_json_log_events(Path(CONFIG.local_log_dir) / "archive-artifacts.log", 1600)
-    current_match_id = ""
-    current_match = None
-    current_delete_only = False
-    latest = None
-    copied = 0
+    states: dict[str, dict] = {}
+    latest: dict | None = None
+    last_copy_match_id = ""
+    last_delete_match_id = ""
     for item in events:
-        if item.get("match_id"):
-            current_match_id = str(item.get("match_id") or "")
-            current_match = matches_by_id.get(current_match_id)
-            current_delete_only = bool(item.get("delete_source"))
-            copied = 0
+        match = archive_event_match(item, matches_by_id)
+        match_id = str((match or {}).get("match_id") or item.get("match_id") or "")
         msg = event_message(item)
-        if current_delete_only:
-            continue
+        timestamp = item.get("_timestamp") or 0
+        if msg == "archive plan ready" and match_id:
+            states[match_id] = {
+                "match": match,
+                "total": to_int(item.get("artifacts")) or (match or {}).get("source_artifacts") or 14,
+                "copied_ids": set(),
+                "deleted_ids": set(),
+                "delete_source": bool(item.get("delete_source")),
+                "last_ts": timestamp,
+            }
+        state = states.get(match_id) if match_id else None
+        if state is None and match_id:
+            state = states.setdefault(
+                match_id,
+                {
+                    "match": match,
+                    "total": (match or {}).get("source_artifacts") or 14,
+                    "copied_ids": set(),
+                    "deleted_ids": set(),
+                    "delete_source": False,
+                    "last_ts": timestamp,
+                },
+            )
         if msg == "copy verified":
-            copied += 1
+            if state and state.get("delete_source"):
+                continue
+            if state is None:
+                continue
+            if item.get("artifact_id") is not None:
+                state["copied_ids"].add(str(item.get("artifact_id")))
+            else:
+                state["copied_ids"].add(str(len(state["copied_ids"]) + 1))
+            state["last_ts"] = timestamp
+            copied = len(state["copied_ids"])
+            total = state.get("total") or 14
+            last_copy_match_id = match_id
             latest = {
                 "state": "running",
-                "match": current_match,
-                "metric": f"{copied}/14 文件",
+                "match": state.get("match"),
+                "metric": f"{copied}/{total} 文件",
                 "detail": f"正在复制 {item.get('role') or ''}".strip(),
-                "timestamp": item.get("_timestamp") or 0,
+                "timestamp": timestamp,
             }
+        elif msg == "source deleted after upload and archive":
+            if state and item.get("artifact_id") is not None:
+                state["deleted_ids"].add(str(item.get("artifact_id")))
+                state["last_ts"] = timestamp
+                last_delete_match_id = match_id
         elif msg == "archive completed":
+            copied = to_int(item.get("copied"))
+            deleted = to_int(item.get("deleted"))
+            done_match_id = last_copy_match_id if copied else last_delete_match_id
+            state = states.get(done_match_id)
+            if not state or state.get("delete_source") or not copied:
+                continue
             latest = {
                 "state": "done",
-                "match": current_match,
-                "metric": f"{item.get('copied', copied)} 个文件",
+                "match": state.get("match"),
+                "metric": f"{copied or len(state['copied_ids'])} 个文件",
                 "detail": "复制校验完成",
-                "timestamp": item.get("_timestamp") or 0,
+                "timestamp": timestamp,
             }
         elif msg in ("archive plan ready", "archive match lock acquired"):
+            if state and state.get("delete_source"):
+                continue
+            if state is None:
+                continue
+            state["last_ts"] = timestamp
             latest = {
                 "state": "running",
-                "match": current_match,
+                "match": state.get("match"),
                 "metric": "准备中",
                 "detail": msg,
-                "timestamp": item.get("_timestamp") or 0,
+                "timestamp": timestamp,
             }
     return latest
+
+
+def archive_event_match(item: dict, matches_by_id: dict[str, dict]) -> dict | None:
+    match_id = str(item.get("match_id") or "")
+    if match_id:
+        return matches_by_id.get(match_id)
+    path_text = " ".join(str(item.get(key) or "") for key in ("source", "target"))
+    match = re.search(r"/(\d+)\.\s*[^/]+/", path_text)
+    if not match:
+        return None
+    order = int(match.group(1))
+    zone_hint = ""
+    zone_match = re.search(r"/([^/]*赛区)/\d+\.\s*[^/]+/", path_text)
+    if zone_match:
+        zone_hint = zone_match.group(1)
+    candidates = [item for item in matches_by_id.values() if to_int(item.get("order")) == order]
+    if zone_hint:
+        zoned = [item for item in candidates if zone_hint in str(item.get("zone") or "")]
+        if zoned:
+            return zoned[-1]
+    return candidates[-1] if candidates else None
 
 
 def read_json_log_events(path: Path, tail: int) -> list[dict]:
@@ -938,7 +1003,16 @@ def biliup_checkpoint() -> dict:
     if not result["ok"]:
         return {}
     checkpoint: dict[str, object] = {}
+    all_uploaded_ts = 0.0
     for line in result["stdout"].splitlines():
+        fields = parse_json_log(line)
+        if fields and event_message(fields) == "biliup upload started":
+            checkpoint = {}
+            all_uploaded_ts = 0.0
+            continue
+        line_ts = log_line_epoch(line)
+        if all_uploaded_ts and line_ts and line_ts < all_uploaded_ts:
+            continue
         match = re.search(r"Upload completed: (.+?) => cost [^,]+, ([0-9.]+ MB/s)", line)
         if match:
             checkpoint["last_file"] = match.group(1)
@@ -953,6 +1027,13 @@ def biliup_checkpoint() -> dict:
             checkpoint["completed"] = None
             checkpoint["current_file"] = ""
             checkpoint["all_uploaded"] = True
+            all_uploaded_ts = line_ts or all_uploaded_ts
+        if "ResponseData" in line and "code: 0" in line:
+            checkpoint["submit_completed"] = True
+            checkpoint["submit_completed_time"] = line_ts
+            bvid_match = re.search(r"\bBV[0-9A-Za-z]{10,}\b", line)
+            if bvid_match:
+                checkpoint["bvid"] = bvid_match.group(0)
     return checkpoint
 
 
@@ -1386,7 +1467,7 @@ def log_line_epoch(line: str) -> float:
     fields = parse_json_log(line)
     if fields:
         return parse_timestamp_epoch(str(fields.get("time") or ""))
-    match = re.match(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(?:[,\.]\d+)?", line)
+    match = re.search(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(?:[,\.]\d+)?", line)
     if not match:
         return 0
     try:
