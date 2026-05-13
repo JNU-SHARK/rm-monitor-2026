@@ -1438,7 +1438,167 @@ def psql(query: str, label: str, issues: list[dict]) -> list[list[str]]:
 
 
 def issue(severity: str, area: str, title: str, detail: str) -> dict:
-    return {"severity": severity, "area": area, "title": title, "detail": detail}
+    display_detail, action = describe_issue(area, title, detail)
+    item = {"severity": severity, "area": area, "title": title, "detail": display_detail}
+    if action:
+        item["action"] = action
+    return item
+
+
+def describe_issue(area: str, title: str, detail: str) -> tuple[str, str]:
+    text = str(detail or "").strip()
+    lower = text.lower()
+
+    if area == "日志":
+        if "ERROR" in title:
+            return (
+                "最近 15 分钟有程序写出了 ERROR 日志，但录制、上传、归档等业务检查没有失败。先按黄色提醒处理。",
+                "如果数量持续增加，展开诊断详情看来源服务；如果同时出现红色业务项，优先处理红色项。",
+            )
+        return (
+            "最近 15 分钟有程序写出了 WARN 日志，表示有异常迹象但暂未阻断流程。",
+            "继续观察即可；数量变多时再展开诊断详情看来源服务。",
+        )
+
+    if area == "日志采集":
+        return (
+            "dashboard 没能读取这一路日志，所以页面可能少了一部分状态信息。",
+            "先刷新页面；仍存在时检查 dashboard 服务权限和对应日志文件。",
+        )
+
+    if area == "Kubernetes":
+        if title.startswith("record-") and "job failed" in lower:
+            return (
+                "某个录制容器失败了。已成功续录并合并的分段会被自动忽略；如果还显示在这里，说明对应成品可能没生成。",
+                "先看“自动录制”和“最终文件”卡片；成品缺失时立即在群里提醒修复。",
+            )
+        if "deployment ready" in lower:
+            return (
+                "有服务副本没有全部启动，相关功能可能不完整。",
+                "等待 Kubernetes 自动重启；几分钟不恢复就检查该服务日志。",
+            )
+        if "pod phase=" in lower:
+            return (
+                "有容器没有处于正常运行状态，可能导致对应组件不可用。",
+                "检查这个 Pod 的事件和日志，确认是启动慢、资源不足还是程序退出。",
+            )
+        if "container waiting" in lower:
+            return (
+                "有容器卡在等待状态，服务还没有真正跑起来。",
+                "检查等待原因，常见是镜像拉取失败、配置错误或启动崩溃。",
+            )
+        if "container restarts=" in lower:
+            return (
+                "有容器刚刚重启过，当前可能已经恢复，但需要观察是否反复重启。",
+                "如果重启次数继续增加，再查看该组件日志。",
+            )
+        return (
+            "dashboard 读取 Kubernetes 状态时发现异常，可能影响某个后台组件。",
+            "查看对应 Deployment、Pod 或 Job 的日志。",
+        )
+
+    if area == "数据库":
+        if "timed out" in lower or "timeout" in lower:
+            return (
+                "dashboard 查询数据库超时，当前状态可能不完整。",
+                "刷新看板；如果持续超时，检查 Postgres 容器和机器负载。",
+            )
+        return (
+            "dashboard 查询数据库失败，页面上的流程状态可能不完整。",
+            "先刷新看板；仍存在时检查 Postgres 容器日志。",
+        )
+
+    if area == "录制任务":
+        if "404" in lower or "not found" in lower:
+            return (
+                "官方直播源当时返回 404，这个视角那一段没有可用视频流，常见原因是官方误切、源刷新或网络抖动。",
+                "先确认最终 FLV 是否已由后续分段合并生成；未生成时需要补录或标记缺失。",
+            )
+        if "403" in lower or "forbidden" in lower:
+            return (
+                "直播源拒绝访问，这个视角当时没有拉到流。",
+                "确认网络规则和直播链接是否刷新；未自动恢复时需要手动介入。",
+            )
+        if "timed out" in lower or "timeout" in lower:
+            return (
+                "录制拉流超时，通常是直播源或网络短暂不可达。",
+                "看后续是否已自动续录并合并；如果没有成品，手动重录或标记缺失。",
+            )
+        if "connection" in lower:
+            return (
+                "录制连接中断或无法建立，可能是网络波动或直播源临时不可用。",
+                "确认后续分段是否补上；没有补上时需要尽快处理。",
+            )
+        return (
+            "某个视角录制任务失败，可能影响该视角最终文件。",
+            "先看“最终文件”是否已有对应视角成品；没有就按录制故障处理。",
+        )
+
+    if area == "录制链路":
+        return (
+            "官方赛程显示比赛已经开始，但系统没有正在录制的任务，存在漏录风险。",
+            "立即检查录制调度器；正式比赛时在群里提醒全体成员协助修复。",
+        )
+
+    if area == "转码任务":
+        return (
+            "压缩转码失败，原始 FLV 不一定受影响，但压缩版不会生成。",
+            "若当前策略是上传原始 FLV，可先不阻塞；需要压缩版时再重跑转码。",
+        )
+
+    if area == "上传任务":
+        if "limit" in lower or "rate" in lower or "too many" in lower:
+            return (
+                "B站上传或投稿触发限流，视频可能需要排队或稍后重试。",
+                "保持队列运行，必要时降低并发；不要重复手动投稿同一场。",
+            )
+        if "duplicate" in lower or "重复" in text:
+            return (
+                "B站可能认为这个视频已经投过，当前投稿没有继续。",
+                "先确认稿件列表和飞书链接，避免重复投稿。",
+            )
+        return (
+            "B站上传或飞书回填失败，对应场次可能暂时没有可打开的视频链接。",
+            "检查上传队列；确认失败后重试该场上传。",
+        )
+
+    if area == "本机脚本":
+        if "bili" in title.lower() or "upload" in title.lower():
+            return (
+                "本机 B站上传脚本报错，上传队列可能卡在某个场次或分P。",
+                "看上传队列当前场次；必要时重试失败场次。",
+            )
+        if "archive" in title.lower():
+            return (
+                "长期归档脚本报错，文件可能还没有复制到长期目录。",
+                "确认本地源文件仍在；归档成功前不要清理本地文件。",
+            )
+        return (
+            "某个本机辅助脚本报错，可能影响上传、归档或清理流程。",
+            "看流程卡片定位是哪一步，再打开诊断详情查看具体脚本。",
+        )
+
+    if area == "存储":
+        if "磁盘使用率" in text:
+            return (
+                f"{title} 空间使用率偏高，继续录制可能逐步挤占可用空间。",
+                "优先确认上传和长期归档是否在跑；必要时清理已完成且已归档的本地文件。",
+            )
+        return (
+            "dashboard 读取存储容量失败，无法判断剩余空间是否安全。",
+            "检查挂载点是否还在，以及 `df` 是否能正常返回。",
+        )
+
+    if area == "外部源":
+        return (
+            f"dashboard 当前访问不到{title}，自动获取赛程或直播信息可能受影响。",
+            "确认网络能直连官方接口；正式比赛中如果持续不可达，需要手动核对赛程和直播。",
+        )
+
+    return (
+        text or "发现异常，但没有更多上下文。",
+        "展开诊断详情查看来源服务和原始日志。",
+    )
 
 
 def pod_owned_by_job(item: dict) -> bool:
@@ -1844,6 +2004,7 @@ INDEX_HTML = r"""<!doctype html>
     .issue-item.warn { border-left-color: var(--amber); background: var(--amber-bg); }
     .issue-title { font-weight: 760; }
     .issue-detail { color: var(--muted); margin-top: 4px; overflow-wrap: anywhere; }
+    .issue-action { margin-top: 5px; color: var(--ink); overflow-wrap: anywhere; }
     .empty { color: var(--muted); padding: 14px 2px; }
     .mini-grid { display: grid; gap: 10px; }
     .history-panel { margin-top: 14px; }
@@ -2035,7 +2196,7 @@ INDEX_HTML = r"""<!doctype html>
 
     function firstIssue(issues, areas, fallback) {
       const item = issues.find(issue => areas.includes(issue.area));
-      return item ? `${item.title}：${item.detail}` : fallback;
+      return item ? `${item.title}：${item.detail}${item.action ? ` 建议：${item.action}` : ""}` : fallback;
     }
 
     function card(label, value, cls, detail, primary = false) {
@@ -2155,7 +2316,7 @@ INDEX_HTML = r"""<!doctype html>
         : `<div class="empty">暂无流程数据</div>`;
 
       $("issues").innerHTML = issues.length
-        ? issues.map(item => `<div class="issue-item ${esc(item.severity)}"><div class="issue-title">${esc(item.area)} · ${esc(item.title)}</div><div class="issue-detail">${esc(item.detail)}</div></div>`).join("")
+        ? issues.map(item => `<div class="issue-item ${esc(item.severity)}"><div class="issue-title">${esc(item.area)} · ${esc(item.title)}</div><div class="issue-detail">${esc(item.detail)}</div>${item.action ? `<div class="issue-action">建议：${esc(item.action)}</div>` : ""}</div>`).join("")
         : `<div class="empty">暂无问题</div>`;
 
       const records = history.record_tasks || {};
