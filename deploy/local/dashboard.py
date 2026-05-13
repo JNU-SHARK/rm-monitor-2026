@@ -42,6 +42,8 @@ LOG_TARGETS = [
 LOG_SINCE_OPTIONS = {"5m", "15m", "30m", "1h", "3h", "6h", "12h", "today"}
 LEVELS = ["ERROR", "WARN", "INFO", "DEBUG", "OTHER"]
 CURRENT_LOG_SECONDS = 15 * 60
+LOCAL_ISSUE_SECONDS = 2 * 60 * 60
+JOB_ISSUE_SECONDS = 60 * 60
 CONFIG = None
 
 
@@ -128,11 +130,11 @@ def collect_logs(query: dict[str, list[str]]) -> dict:
     for name, resolved in resolve_targets(target, errors):
         raw_lines.extend(fetch_target_logs(name, resolved, since, tail, errors))
 
-    parsed = [parse_log_line(item["target"], item["line"]) for item in raw_lines]
-    parsed = apply_filters(parsed, level, keyword)
+    parsed_all = [parse_log_line(item["target"], item["line"]) for item in raw_lines]
+    parsed = apply_filters(parsed_all, level, keyword)
     parsed.sort(key=lambda item: item.get("time_sort") or "", reverse=True)
-    issues = collect_issues(parsed, errors)
-    summary = summarize(parsed, errors, issues)
+    issues = collect_issues(parsed_all, errors)
+    summary = summarize(parsed_all, errors, issues)
     history = collect_history()
     current = collect_current_snapshot()
 
@@ -347,6 +349,7 @@ def detect_category(text: str, fields: dict[str, str], message: str) -> str:
 
 
 def apply_filters(lines: list[dict], level: str, keyword: str) -> list[dict]:
+    lines = list(lines)
     if level != "ALL":
         lines = [item for item in lines if item.get("level") == level]
     keyword = keyword.strip().lower()
@@ -365,7 +368,7 @@ def collect_issues(lines: list[dict], log_errors: list[dict]) -> list[dict]:
     issues: list[dict] = []
     for err in log_errors:
         issues.append(issue("bad", "日志采集", err["label"], err["message"]))
-    recent_lines = [item for item in lines if is_recent_log(item, CURRENT_LOG_SECONDS)]
+    recent_lines = [item for item in lines if is_recent_log(item, CURRENT_LOG_SECONDS) and not is_benign_log_item(item)]
     error_logs = [item for item in recent_lines if item.get("level") == "ERROR"]
     warn_logs = [item for item in recent_lines if item.get("level") == "WARN"]
     if error_logs:
@@ -404,6 +407,8 @@ def collect_kubernetes_issues(issues: list[dict]) -> None:
             for status in statuses
             if status.get("state", {}).get("waiting")
         ]
+        if phase == "Failed" and pod_owned_by_job(item):
+            continue
         if phase not in ("Running", "Succeeded"):
             issues.append(issue("bad", "Kubernetes", name, f"Pod phase={phase}"))
         elif waiting:
@@ -414,8 +419,11 @@ def collect_kubernetes_issues(issues: list[dict]) -> None:
     data = kubectl_json(["get", "jobs", "-n", CONFIG.namespace, "-o", "json"], "jobs", issues)
     for item in data.get("items", []) or []:
         name = item.get("metadata", {}).get("name", "")
-        failed = int(item.get("status", {}).get("failed") or 0)
-        if failed:
+        status = item.get("status", {})
+        failed = int(status.get("failed") or 0)
+        succeeded = int(status.get("succeeded") or 0)
+        active = int(status.get("active") or 0)
+        if failed and not succeeded and (active or job_is_recent(item, JOB_ISSUE_SECONDS)):
             issues.append(issue("bad", "Kubernetes", name, f"Job failed pods={failed}"))
 
 
@@ -515,32 +523,52 @@ def collect_local_log_issues(issues: list[dict]) -> None:
     log_dir = Path(CONFIG.local_log_dir)
     if not log_dir.exists():
         return
-    cutoff = time.time() - 24 * 60 * 60
+    cutoff = time.time() - LOCAL_ISSUE_SECONDS
+    events = []
     for path in sorted(log_dir.glob("*.log")):
-        result = run(["tail", "-n", "400", str(path)], timeout=4)
+        result = run(["tail", "-n", "1000", str(path)], timeout=4)
         if not result["ok"]:
             issues.append(issue("bad", "本机日志", path.name, result["error"]))
             continue
-        hits = []
         for line in result["stdout"].splitlines():
             fields = parse_json_log(line)
             if not fields:
                 continue
-            level = str(fields.get("level") or "").upper()
-            if level not in ("ERROR", "WARN"):
-                continue
             timestamp = parse_timestamp_epoch(str(fields.get("time") or ""))
             if timestamp and timestamp < cutoff:
                 continue
-            service = str(fields.get("service") or path.stem)
-            message = str(fields.get("msg") or fields.get("detail") or fields.get("error") or line)
-            detail = message
-            if fields.get("detail"):
-                detail += f": {fields['detail']}"
-            if fields.get("exit_code") is not None:
-                detail += f" (exit_code={fields['exit_code']})"
-            hits.append(issue("bad" if level == "ERROR" else "warn", "本机脚本", service, detail))
-        issues.extend(hits[-3:])
+            events.append({"path": path, "fields": fields, "timestamp": timestamp})
+
+    successful_at: dict[str, float] = {}
+    for event in events:
+        fields = event["fields"]
+        if not is_local_success_event(fields):
+            continue
+        for key in local_event_keys(fields, event["path"]):
+            successful_at[key] = max(successful_at.get(key, 0), event["timestamp"] or 0)
+
+    hits = []
+    for event in events:
+        fields = event["fields"]
+        if is_benign_json_event(fields):
+            continue
+        level = str(fields.get("level") or "").upper()
+        if level not in ("ERROR", "WARN"):
+            continue
+        keys = local_event_keys(fields, event["path"])
+        timestamp = event["timestamp"] or 0
+        if any(successful_at.get(key, 0) > timestamp for key in keys):
+            continue
+        service = str(fields.get("service") or event["path"].stem)
+        message = str(fields.get("msg") or fields.get("detail") or fields.get("error") or "")
+        detail = message or str(fields)
+        if fields.get("detail"):
+            detail += f": {fields['detail']}"
+        if fields.get("exit_code") is not None:
+            detail += f" (exit_code={fields['exit_code']})"
+        hits.append((timestamp, issue("bad" if level == "ERROR" else "warn", "本机脚本", service, detail)))
+    hits.sort(key=lambda item: item[0])
+    issues.extend(item[1] for item in hits[-8:])
 
 
 def collect_external_issues(issues: list[dict]) -> None:
@@ -572,7 +600,7 @@ def collect_current_snapshot() -> dict:
         phase = item.get("status", {}).get("phase", "")
         if phase == "Running":
             current["pods"]["running"] += 1
-        elif phase == "Succeeded":
+        elif phase == "Succeeded" or (phase == "Failed" and pod_owned_by_job(item)):
             current["pods"]["succeeded"] += 1
         else:
             current["pods"]["other"] += 1
@@ -804,6 +832,60 @@ def issue(severity: str, area: str, title: str, detail: str) -> dict:
     return {"severity": severity, "area": area, "title": title, "detail": detail}
 
 
+def pod_owned_by_job(item: dict) -> bool:
+    owners = item.get("metadata", {}).get("ownerReferences", []) or []
+    return any(owner.get("kind") == "Job" for owner in owners)
+
+
+def job_is_recent(item: dict, seconds: int) -> bool:
+    status = item.get("status", {})
+    candidates = []
+    for condition in status.get("conditions", []) or []:
+        if condition.get("lastTransitionTime"):
+            candidates.append(str(condition["lastTransitionTime"]))
+    for key in ("completionTime", "startTime"):
+        if status.get(key):
+            candidates.append(str(status[key]))
+    timestamps = [parse_timestamp_epoch(value) for value in candidates]
+    timestamps = [value for value in timestamps if value]
+    return bool(timestamps and max(timestamps) >= time.time() - seconds)
+
+
+def is_benign_log_item(item: dict) -> bool:
+    fields = parse_json_log(str(item.get("raw") or ""))
+    if fields:
+        return is_benign_json_event(fields)
+    raw = str(item.get("raw") or "").lower()
+    return "script interrupted" in raw or "exit_code=130" in raw or '"exit_code": 130' in raw
+
+
+def is_benign_json_event(fields: dict) -> bool:
+    msg = str(fields.get("msg") or fields.get("message") or "").lower()
+    exit_code = str(fields.get("exit_code") or "")
+    return exit_code == "130" or "script interrupted" in msg
+
+
+def local_event_keys(fields: dict, path: Path) -> list[str]:
+    service = str(fields.get("service") or path.stem)
+    keys = [f"{service}:service"]
+    match_id = str(fields.get("match_id") or "")
+    if match_id:
+        keys.append(f"{service}:match:{match_id}")
+        return keys
+    order = fields.get("order")
+    if order is not None and str(order) != "":
+        zone = str(fields.get("zone") or "")
+        keys.append(f"{service}:order:{zone}:{order}")
+    return keys
+
+
+def is_local_success_event(fields: dict) -> bool:
+    if str(fields.get("level") or "").upper() != "INFO":
+        return False
+    msg = str(fields.get("msg") or fields.get("message") or "").lower()
+    return "completed" in msg or "finished" in msg
+
+
 def has_recent_restart(statuses: list[dict]) -> bool:
     cutoff = time.time() - 60 * 60
     saw_restart_without_time = False
@@ -827,7 +909,7 @@ def summarize(lines: list[dict], errors: list[dict], issues: list[dict]) -> dict
     by_category = {}
     for item in lines:
         by_level[item["level"]] = by_level.get(item["level"], 0) + 1
-        if is_recent_log(item, CURRENT_LOG_SECONDS):
+        if is_recent_log(item, CURRENT_LOG_SECONDS) and not is_benign_log_item(item):
             current_by_level[item["level"]] = current_by_level.get(item["level"], 0) + 1
         by_target[item["target"]] = by_target.get(item["target"], 0) + 1
         by_category[item["category"]] = by_category.get(item["category"], 0) + 1
