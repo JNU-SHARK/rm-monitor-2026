@@ -719,7 +719,16 @@ def record_pipeline_step(matches: list[dict]) -> dict:
             f"{item['record_running']}/{expected} 路",
             f"源文件 {item['source_artifacts']} 个，失败任务 {item['record_failed']} 个",
         )
-    done = latest_match(matches, lambda item: item["latest_status"] == "DONE")
+    done = latest_match(
+        matches,
+        lambda item: item["latest_status"] == "DONE"
+        or (
+            item["record_tasks"] > 0
+            and item["record_running"] == 0
+            and item["record_failed"] == 0
+            and item["record_succeeded"] > 0
+        ),
+    )
     if done:
         return pipeline_step("自动录制", "done", done, "已收尾", f"成功任务 {done['record_succeeded']} 个")
     return pipeline_step("自动录制", "idle", None, "等待", "暂无正在录制的比赛")
