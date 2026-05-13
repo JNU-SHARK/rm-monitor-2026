@@ -97,7 +97,10 @@ class LogDashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def send_text(self, value: str, content_type: str) -> None:
         body = value.encode("utf-8")
@@ -106,7 +109,10 @@ class LogDashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
 
 def collect_logs(query: dict[str, list[str]]) -> dict:
@@ -485,17 +491,25 @@ def collect_database_issues(issues: list[dict]) -> None:
                 issues.append(issue("bad", area, f"{area} #{row[0]} {row[1]}".strip(), detail))
 
     query = """
-        select m.zone, m."order", count(rt.id)
+        select
+          m.zone,
+          m."order",
+          count(rt.id),
+          count(rt.id) filter (where rt.status in ('PENDING', 'DISPATCHING', 'RUNNING'))
         from matches m
-        left join match_rounds mr on mr.match_rounds = m.id and mr.status = 'STARTED'
+        left join match_rounds mr on mr.match_rounds = m.id
         left join record_tasks rt on rt.match_round_record_tasks = mr.id
         where m.latest_status = 'STARTED'
         group by m.id
-        having count(rt.id) = 0;
+        having count(rt.id) = 0
+            or count(rt.id) filter (where rt.status in ('PENDING', 'DISPATCHING', 'RUNNING')) = 0;
     """
     for row in psql(query, "started_matches_without_record_tasks", issues):
-        if len(row) >= 3:
-            issues.append(issue("bad", "录制链路", f"{row[0]}第{row[1]}场", "比赛已 STARTED，但没有录制任务"))
+        if len(row) >= 4:
+            detail = "比赛已 STARTED，但没有录制任务"
+            if to_int(row[2]) > 0:
+                detail = f"比赛已 STARTED，但没有运行中的录制任务；现有录制任务 {row[2]} 个"
+            issues.append(issue("bad", "录制链路", f"{row[0]}第{row[1]}场", detail))
 
 
 def collect_storage_issues(issues: list[dict]) -> None:
