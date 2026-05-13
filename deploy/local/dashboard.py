@@ -436,7 +436,7 @@ def collect_issues(lines: list[dict], log_errors: list[dict]) -> list[dict]:
     error_logs = [item for item in recent_lines if item.get("level") == "ERROR"]
     warn_logs = [item for item in recent_lines if item.get("level") == "WARN"]
     if error_logs:
-        issues.append(issue("bad", "日志", "近期 ERROR 日志", f"最近 15 分钟有 {len(error_logs)} 条 ERROR"))
+        issues.append(issue("warn", "日志", "近期 ERROR 日志", f"最近 15 分钟有 {len(error_logs)} 条 ERROR"))
     if warn_logs:
         issues.append(issue("warn", "日志", "近期 WARN 日志", f"最近 15 分钟有 {len(warn_logs)} 条 WARN"))
 
@@ -480,6 +480,7 @@ def collect_kubernetes_issues(issues: list[dict]) -> None:
         elif restarts and has_recent_restart(statuses):
             issues.append(issue("warn", "Kubernetes", name, f"Container restarts={restarts}"))
 
+    compensated_record_tasks = compensated_failed_record_task_ids()
     data = kubectl_json(["get", "jobs", "-n", CONFIG.namespace, "-o", "json"], "jobs", issues)
     for item in data.get("items", []) or []:
         name = item.get("metadata", {}).get("name", "")
@@ -487,6 +488,9 @@ def collect_kubernetes_issues(issues: list[dict]) -> None:
         failed = int(status.get("failed") or 0)
         succeeded = int(status.get("succeeded") or 0)
         active = int(status.get("active") or 0)
+        record_task = re.fullmatch(r"record-(\d+)", name)
+        if record_task and record_task.group(1) in compensated_record_tasks:
+            continue
         if failed and not succeeded and (active or job_is_recent(item, JOB_ISSUE_SECONDS)):
             issues.append(issue("bad", "Kubernetes", name, f"Job failed pods={failed}"))
 
@@ -504,6 +508,19 @@ def collect_database_issues(issues: list[dict]) -> None:
               and rt.updated_at > now() - interval '24 hours'
               and m.event not like '%测试%'
               and m.zone not like '%测试%'
+              and not (
+                rt.role like '%__part%'
+                and exists (
+                  select 1
+                  from record_tasks merged_rt
+                  join match_rounds merged_mr on merged_mr.id = merged_rt.match_round_record_tasks
+                  join media_artifacts merged_ma on merged_ma.record_task_media_artifacts = merged_rt.id
+                  where merged_mr.match_rounds = mr.match_rounds
+                    and merged_rt.status = 'SUCCEEDED'
+                    and merged_ma.kind = 'source'
+                    and merged_rt.role = regexp_replace(rt.role, '__part[0-9]+$', '')
+                )
+              )
             order by rt.updated_at desc
             limit 10;
             """,
@@ -568,6 +585,31 @@ def collect_database_issues(issues: list[dict]) -> None:
             if to_int(row[2]) > 0:
                 detail = f"比赛已 STARTED，但没有运行中的录制任务；现有录制任务 {row[2]} 个"
             issues.append(issue("bad", "录制链路", f"{row[0]}第{row[1]}场", detail))
+
+
+def compensated_failed_record_task_ids() -> set[str]:
+    query = """
+        select rt.id
+        from record_tasks rt
+        join match_rounds mr on mr.id = rt.match_round_record_tasks
+        join matches m on m.id = mr.match_rounds
+        where rt.status = 'FAILED'
+          and rt.updated_at > now() - interval '24 hours'
+          and rt.role like '%__part%'
+          and m.event not like '%测试%'
+          and m.zone not like '%测试%'
+          and exists (
+            select 1
+            from record_tasks merged_rt
+            join match_rounds merged_mr on merged_mr.id = merged_rt.match_round_record_tasks
+            join media_artifacts merged_ma on merged_ma.record_task_media_artifacts = merged_rt.id
+            where merged_mr.match_rounds = mr.match_rounds
+              and merged_rt.status = 'SUCCEEDED'
+              and merged_ma.kind = 'source'
+              and merged_rt.role = regexp_replace(rt.role, '__part[0-9]+$', '')
+          );
+    """
+    return {row[0] for row in psql(query, "compensated_failed_record_tasks", []) if row}
 
 
 def collect_storage_issues(issues: list[dict]) -> None:
@@ -2084,7 +2126,7 @@ INDEX_HTML = r"""<!doctype html>
       const upload = statusFor(issues, ["上传任务", "本机脚本"]);
       const storage = statusFor(issues, ["存储"]);
       const external = statusFor(issues, ["外部源"]);
-      const logSignal = (currentLevels.ERROR || summary.bad_issues) ? "bad" : ((currentLevels.WARN || summary.warn_issues) ? "warn" : "ok");
+      const logSignal = summary.bad_issues ? "bad" : ((currentLevels.ERROR || currentLevels.WARN || summary.warn_issues) ? "warn" : "ok");
       const action = severity === "bad" ? "需要立即处理" : (severity === "warn" ? "可以继续，赛前确认" : "可以值守");
       const headlineDetail = severity === "bad"
         ? "下面的“需要处理”就是优先处理列表"
@@ -2094,7 +2136,7 @@ INDEX_HTML = r"""<!doctype html>
         card("总判断", action, severity, headlineDetail, true),
         card("严重问题", summary.bad_issues || 0, summary.bad_issues ? "bad" : "ok", summary.bad_issues ? "必须处理" : "无"),
         card("风险提示", summary.warn_issues || 0, summary.warn_issues ? "warn" : "ok", summary.warn_issues ? "需要留意" : "无"),
-        card("近 15 分钟 ERROR", currentLevels.ERROR || 0, currentLevels.ERROR ? "bad" : "ok", currentLevels.ERROR ? "展开诊断详情查看" : "无"),
+        card("近 15 分钟 ERROR", currentLevels.ERROR || 0, currentLevels.ERROR ? "warn" : "ok", currentLevels.ERROR ? "展开诊断详情查看" : "无"),
         card("近 15 分钟 WARN", currentLevels.WARN || 0, currentLevels.WARN ? "warn" : "ok", currentLevels.WARN ? "展开诊断详情查看" : "无"),
       ].join("");
 
