@@ -759,10 +759,28 @@ def upload_pipeline_step(matches_by_id: dict[str, dict]) -> dict:
         for item in events
         if event_message(item) in ("biliup upload workflow completed", "existing BVID workflow completed")
     ]
+    failures = [
+        item
+        for item in events
+        if event_message(item) in ("biliup upload failed", "biliup submit rate limited")
+    ]
     latest_start = starts[-1] if starts else None
     latest_completion = completions[-1] if completions else None
+    latest_failure = failures[-1] if failures else None
     checkpoint = biliup_checkpoint()
     if latest_start and not event_after_for_match(latest_completion, latest_start):
+        if event_after_for_match(latest_failure, latest_start):
+            match = event_match(latest_failure, matches_by_id) or event_match(latest_start, matches_by_id)
+            message = event_message(latest_failure)
+            if message == "biliup submit rate limited":
+                return pipeline_step("B站上传", "bad", match, "投稿限流", "B站返回投稿过于频繁，等待自动重试")
+            return pipeline_step(
+                "B站上传",
+                "bad",
+                match,
+                f"失败 {latest_failure.get('exit_code', '')}".strip(),
+                "上传流程已报错，源文件仍保留",
+            )
         match = event_match(latest_start, matches_by_id)
         total = to_int(latest_start.get("videos")) or (match or {}).get("source_artifacts") or 14
         done = checkpoint.get("completed")

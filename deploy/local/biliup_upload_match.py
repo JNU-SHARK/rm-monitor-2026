@@ -27,6 +27,7 @@ DEFAULT_TAGS = "RoboMaster,RMUC2026,机器人竞赛"
 DEFAULT_SEASON_NAME = "RMUC2026南部赛区录制"
 DEFAULT_COPYRIGHT = "2"
 DEFAULT_REPOST_SOURCE = "RoboMaster 官方直播"
+DEFAULT_BILI_SUBMIT = "web"
 DEFAULT_BITABLE_LINK_FIELD = "视频链接"
 DEFAULT_LARK_SECRET_NAME = "rm-monitor-lark"
 DEFAULT_SCHEDULE_URL = "https://pro-robomasters-hz-n5i3.oss-cn-hangzhou.aliyuncs.com/live_json/schedule.json"
@@ -123,6 +124,12 @@ def main() -> int:
     parser.add_argument("--tid", default="171", help="Bilibili category id. 171 is e-sports.")
     parser.add_argument("--copyright", default=DEFAULT_COPYRIGHT, help="1 self-made, 2 repost.")
     parser.add_argument("--source", default=DEFAULT_REPOST_SOURCE, help="Repost source when copyright=2.")
+    parser.add_argument(
+        "--bili-submit",
+        default=DEFAULT_BILI_SUBMIT,
+        choices=["app", "web", "b-cut-android"],
+        help="biliup final submit API. web avoids APP submit frequency limits seen during match-day batches.",
+    )
     parser.add_argument("--line", default="", help="Upload line, for example bda2/tx.")
     parser.add_argument("--limit", default="3", help="Per-file upload concurrency.")
     parser.add_argument("--tags", default=DEFAULT_TAGS)
@@ -302,6 +309,7 @@ def main() -> int:
         "INFO",
         "biliup upload plan ready",
         submit=args.submit,
+        bili_submit=args.bili_submit,
         match_id=match_info.match_id,
         title=title,
         videos=len(video_paths),
@@ -345,20 +353,24 @@ def main() -> int:
     if code != 0:
         if archive_process is not None:
             wait_archive_copy(args, match_info, archive_process)
+        rate_limited = is_bili_submit_rate_limited(upload_output)
         local_log.log_event(
             "biliup-upload",
             "ERROR",
-            "biliup upload failed",
+            "biliup submit rate limited" if rate_limited else "biliup upload failed",
             match_id=match_info.match_id,
             title=title,
             exit_code=code,
+            bili_submit=args.bili_submit,
         )
+        alert_title = "Bilibili 投稿限流" if rate_limited else "Bilibili 上传失败"
+        alert_reason = "B站返回投稿过于频繁，稍后会自动重试。" if rate_limited else f"返回码：{code}"
         send_feishu_alert(
             args,
-            "Bilibili 上传失败",
-            f"标题：{title}\n比赛：{match_info.zone} 第{match_info.order}场\n返回码：{code}\n请立即提醒席伟杰修复。源文件仍在 {args.records_root}",
+            alert_title,
+            f"标题：{title}\n比赛：{match_info.zone} 第{match_info.order}场\n{alert_reason}\n请立即提醒席伟杰修复。源文件仍在 {args.records_root}",
         )
-        return code
+        return 75 if rate_limited else code
     bvid = ""
     archive = None
     if season is not None or not args.no_feishu_link or not args.no_feishu_topic_reply:
@@ -687,6 +699,8 @@ def build_command(args: argparse.Namespace, title: str, desc: str, video_paths: 
         args.tags,
         "--limit",
         str(args.limit),
+        "--submit",
+        args.bili_submit,
     ]
     if args.source:
         command.extend(["--source", args.source])
@@ -707,6 +721,10 @@ def run_streaming(command: list[str]) -> tuple[int, str]:
         output.append(line)
         print(line, end="")
     return process.wait(), "".join(output)
+
+
+def is_bili_submit_rate_limited(output: str) -> bool:
+    return "投稿过于频繁" in output or "code: 21566" in output or '"code":21566' in output
 
 
 def archive_command(args: argparse.Namespace, match_info: MatchInfo, *, delete_source: bool = False, delete_source_only: bool = False) -> list[str]:

@@ -18,7 +18,9 @@ DEFAULT_ZONE = "南部赛区"
 DEFAULT_LIMIT = "7"
 DEFAULT_BILIUP = "deploy/local/biliup_direct_docker.sh"
 DEFAULT_RECORDS_ROOT = "/mnt/PC801/rm-monitor/records"
+DEFAULT_BILI_SUBMIT = "web"
 DEFAULT_LOCK_FILE = Path(__file__).resolve().parents[2] / "logs" / "biliup-auto-queue.lock"
+RATE_LIMIT_RETRY_SECONDS = 45 * 60
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -38,6 +40,12 @@ def main() -> int:
     parser.add_argument("--max-order", type=int)
     parser.add_argument("--limit", default=DEFAULT_LIMIT)
     parser.add_argument("--biliup", default=DEFAULT_BILIUP)
+    parser.add_argument(
+        "--bili-submit",
+        default=DEFAULT_BILI_SUBMIT,
+        choices=["app", "web", "b-cut-android"],
+        help="biliup final submit API.",
+    )
     parser.add_argument("--records-root", default=DEFAULT_RECORDS_ROOT)
     parser.add_argument("--namespace", default="rm-monitor")
     parser.add_argument("--postgres", default="deployment/postgres")
@@ -61,6 +69,7 @@ def main() -> int:
         start_order=args.start_order,
         max_order=args.max_order,
         limit=args.limit,
+        bili_submit=args.bili_submit,
         biliup=args.biliup,
         settle_seconds=args.settle_seconds,
         dry_run=args.dry_run,
@@ -92,7 +101,7 @@ def main() -> int:
 
             code = handle_candidate(args, candidate)
             if code != 0:
-                failures[candidate.match_id] = time.time() + 10 * 60
+                failures[candidate.match_id] = time.time() + (RATE_LIMIT_RETRY_SECONDS if code == 75 else 10 * 60)
             if args.once:
                 return code
             time.sleep(2 if code == 0 else args.poll_seconds)
@@ -205,7 +214,15 @@ def handle_candidate(args: argparse.Namespace, candidate: Candidate) -> int:
         action = "complete existing Bilibili upload"
         bvid = existing_bvid
     else:
-        command = base_command(args, candidate) + ["--limit", str(args.limit), "--biliup", args.biliup, "--submit"]
+        command = base_command(args, candidate) + [
+            "--limit",
+            str(args.limit),
+            "--biliup",
+            args.biliup,
+            "--bili-submit",
+            args.bili_submit,
+            "--submit",
+        ]
         action = "upload match to Bilibili"
         bvid = ""
 
@@ -243,6 +260,8 @@ def upload_plan(args: argparse.Namespace, candidate: Candidate) -> dict:
             str(args.limit),
             "--biliup",
             args.biliup,
+            "--bili-submit",
+            args.bili_submit,
             "--no-archive-after-upload",
             "--no-feishu-link",
             "--no-feishu-topic-reply",
