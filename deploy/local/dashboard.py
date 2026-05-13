@@ -143,6 +143,7 @@ def collect_logs(query: dict[str, list[str]]) -> dict:
     summary = summarize(parsed_all, errors, issues)
     history = collect_history()
     current = collect_current_snapshot()
+    pipeline = collect_pipeline_progress()
 
     return {
         "generated_at": now_text(),
@@ -156,6 +157,7 @@ def collect_logs(query: dict[str, list[str]]) -> dict:
         "summary": summary,
         "current": current,
         "history": history,
+        "pipeline": pipeline,
         "issues": issues,
         "lines": parsed[:1200],
         "errors": errors,
@@ -624,6 +626,377 @@ def collect_current_snapshot() -> dict:
     for name, url in (("官方赛程", SCHEDULE_URL), ("官方直播", LIVE_INFO_URL)):
         current["external"].append(external_snapshot(name, url))
     return current
+
+
+def collect_pipeline_progress() -> dict:
+    matches = collect_match_progress()
+    by_id = {item["match_id"]: item for item in matches}
+    return {
+        "steps": [
+            record_pipeline_step(matches),
+            artifact_pipeline_step(matches),
+            archive_pipeline_step(by_id),
+            upload_pipeline_step(by_id),
+            cleanup_pipeline_step(by_id),
+        ],
+        "matches": matches,
+    }
+
+
+def collect_match_progress() -> list[dict]:
+    query = """
+        select
+            m.id,
+            m.event,
+            m.zone,
+            m."order",
+            m.match_type,
+            coalesce(m.match_slug, ''),
+            m.latest_status,
+            rt.school_name,
+            rt.name,
+            bt.school_name,
+            bt.name,
+            count(distinct mr.id) filter (where mr.winner = 'red'),
+            count(distinct mr.id) filter (where mr.winner = 'blue'),
+            count(distinct rec.id),
+            count(distinct rec.id) filter (where rec.status in ('PENDING', 'DISPATCHING', 'RUNNING')),
+            count(distinct rec.id) filter (where rec.status = 'FAILED'),
+            count(distinct rec.id) filter (where rec.status = 'SUCCEEDED'),
+            count(distinct ma.id) filter (where ma.kind = 'source'),
+            coalesce(sum(ma.file_size) filter (where ma.kind = 'source'), 0)
+        from matches m
+        join teams rt on rt.id = m.team_red_matches
+        join teams bt on bt.id = m.team_blue_matches
+        left join match_rounds mr on mr.match_rounds = m.id
+        left join record_tasks rec on rec.match_round_record_tasks = mr.id
+        left join media_artifacts ma on ma.record_task_media_artifacts = rec.id
+        where m.updated_at >= date_trunc('day', now())
+          and m.event not like '%测试%'
+          and m.zone not like '%测试%'
+        group by m.id, rt.id, bt.id
+        order by m."order";
+    """
+    matches = []
+    for row in psql(query, "pipeline_matches", []):
+        if len(row) < 19:
+            continue
+        item = {
+            "match_id": row[0],
+            "event": row[1],
+            "zone": row[2],
+            "order": to_int(row[3]),
+            "match_type": row[4],
+            "match_slug": row[5],
+            "latest_status": row[6],
+            "red_school": row[7],
+            "red_name": row[8],
+            "blue_school": row[9],
+            "blue_name": row[10],
+            "red_score": to_int(row[11]),
+            "blue_score": to_int(row[12]),
+            "record_tasks": to_int(row[13]),
+            "record_running": to_int(row[14]),
+            "record_failed": to_int(row[15]),
+            "record_succeeded": to_int(row[16]),
+            "source_artifacts": to_int(row[17]),
+            "source_bytes": to_int(row[18]),
+        }
+        item["label"] = match_progress_label(item)
+        matches.append(item)
+    return matches
+
+
+def record_pipeline_step(matches: list[dict]) -> dict:
+    running = [item for item in matches if item["latest_status"] == "STARTED" or item["record_running"] > 0]
+    if running:
+        item = running[-1]
+        expected = max(14, item["record_tasks"], item["record_running"])
+        return pipeline_step(
+            "自动录制",
+            "running",
+            item,
+            f"{item['record_running']}/{expected} 路",
+            f"源文件 {item['source_artifacts']} 个，失败任务 {item['record_failed']} 个",
+        )
+    done = latest_match(matches, lambda item: item["latest_status"] == "DONE")
+    if done:
+        return pipeline_step("自动录制", "done", done, "已收尾", f"成功任务 {done['record_succeeded']} 个")
+    return pipeline_step("自动录制", "idle", None, "等待", "暂无正在录制的比赛")
+
+
+def artifact_pipeline_step(matches: list[dict]) -> dict:
+    current = latest_match(matches, lambda item: item["source_artifacts"] > 0)
+    if current:
+        state = "running" if current["latest_status"] == "STARTED" else "done"
+        metric = f"{current['source_artifacts']} 个源文件"
+        detail = f"合计 {human_bytes(current['source_bytes'])}"
+        return pipeline_step("最终文件", state, current, metric, detail)
+    return pipeline_step("最终文件", "idle", None, "等待", "暂无源文件产物")
+
+
+def archive_pipeline_step(matches_by_id: dict[str, dict]) -> dict:
+    status = archive_artifact_status(matches_by_id)
+    if status:
+        return pipeline_step(
+            "长期归档",
+            status["state"],
+            status.get("match"),
+            status.get("metric", ""),
+            status.get("detail", ""),
+        )
+    status = latest_queue_status(Path(CONFIG.local_log_dir) / "archive-auto-queue.log", matches_by_id)
+    if status:
+        return pipeline_step("长期归档", status["state"], status.get("match"), status.get("metric", ""), status.get("detail", ""))
+    return pipeline_step("长期归档", "idle", None, "等待", "暂无归档记录")
+
+
+def upload_pipeline_step(matches_by_id: dict[str, dict]) -> dict:
+    events = read_json_log_events(Path(CONFIG.local_log_dir) / "biliup-upload.log", 1200)
+    starts = [item for item in events if event_message(item) == "biliup upload started"]
+    completions = [
+        item
+        for item in events
+        if event_message(item) in ("biliup upload workflow completed", "existing BVID workflow completed")
+    ]
+    latest_start = starts[-1] if starts else None
+    latest_completion = completions[-1] if completions else None
+    checkpoint = biliup_checkpoint()
+    if latest_start and not event_after_for_match(latest_completion, latest_start):
+        match = event_match(latest_start, matches_by_id)
+        total = to_int(latest_start.get("videos")) or (match or {}).get("source_artifacts") or 14
+        done = checkpoint.get("completed")
+        if done is not None:
+            metric = f"{done}/{total} 分P"
+        elif checkpoint.get("all_uploaded"):
+            metric = f"{total}/{total} 分P"
+        else:
+            metric = f"{total} 分P"
+        detail_parts = []
+        if checkpoint.get("speed"):
+            detail_parts.append(f"最近 {checkpoint['speed']}")
+        if checkpoint.get("current_file"):
+            detail_parts.append(f"当前 {checkpoint['current_file']}")
+        return pipeline_step("B站上传", "running", match, metric, "，".join(detail_parts) or "上传中")
+    if latest_completion:
+        match = event_match(latest_completion, matches_by_id)
+        metric = str(latest_completion.get("bvid") or "已投稿")
+        return pipeline_step("B站上传", "done", match, metric, "飞书回填和后续清理由上传流程处理")
+    return pipeline_step("B站上传", "idle", None, "等待", "暂无上传记录")
+
+
+def cleanup_pipeline_step(matches_by_id: dict[str, dict]) -> dict:
+    events = read_json_log_events(Path(CONFIG.local_log_dir) / "biliup-upload.log", 1200)
+    starts = [item for item in events if event_message(item) == "local source deletion started after upload and archive"]
+    completions = [item for item in events if event_message(item) == "local source deletion completed after upload and archive"]
+    latest_start = starts[-1] if starts else None
+    latest_completion = completions[-1] if completions else None
+    if latest_start and not event_after_for_match(latest_completion, latest_start):
+        return pipeline_step("本地清理", "running", event_match(latest_start, matches_by_id), "删除中", "上传和归档均完成后删除本地源文件")
+    if latest_completion:
+        return pipeline_step("本地清理", "done", event_match(latest_completion, matches_by_id), "已清理", "本地源文件已按流程释放")
+    return pipeline_step("本地清理", "idle", None, "等待", "等待上传和长期归档完成")
+
+
+def pipeline_step(label: str, state: str, match: dict | None, metric: str, detail: str) -> dict:
+    return {
+        "label": label,
+        "state": state,
+        "match_id": match.get("match_id") if match else "",
+        "match_label": match.get("label") if match else "暂无场次",
+        "metric": metric,
+        "detail": detail,
+    }
+
+
+def latest_match(matches: list[dict], predicate) -> dict | None:
+    result = None
+    for item in matches:
+        if predicate(item):
+            result = item
+    return result
+
+
+def latest_queue_status(path: Path, matches_by_id: dict[str, dict]) -> dict | None:
+    events = read_json_log_events(path, 1200)
+    selected = [item for item in events if event_message(item) in ("archive candidate selected", "candidate selected")]
+    finished = [item for item in events if event_message(item) in ("archive candidate finished", "candidate workflow finished")]
+    if selected and not event_after_for_match(finished[-1] if finished else None, selected[-1]):
+        return {"state": "running", "match": event_match(selected[-1], matches_by_id), "metric": "进行中", "detail": event_message(selected[-1])}
+    if finished:
+        return {"state": "done", "match": event_match(finished[-1], matches_by_id), "metric": "已完成", "detail": event_message(finished[-1])}
+    return None
+
+
+def archive_artifact_status(matches_by_id: dict[str, dict]) -> dict | None:
+    events = read_json_log_events(Path(CONFIG.local_log_dir) / "archive-artifacts.log", 1600)
+    current_match_id = ""
+    current_match = None
+    current_delete_only = False
+    latest = None
+    copied = 0
+    for item in events:
+        if item.get("match_id"):
+            current_match_id = str(item.get("match_id") or "")
+            current_match = matches_by_id.get(current_match_id)
+            current_delete_only = bool(item.get("delete_source"))
+            copied = 0
+        msg = event_message(item)
+        if current_delete_only:
+            continue
+        if msg == "copy verified":
+            copied += 1
+            latest = {
+                "state": "running",
+                "match": current_match,
+                "metric": f"{copied}/14 文件",
+                "detail": f"正在复制 {item.get('role') or ''}".strip(),
+                "timestamp": item.get("_timestamp") or 0,
+            }
+        elif msg == "archive completed":
+            latest = {
+                "state": "done",
+                "match": current_match,
+                "metric": f"{item.get('copied', copied)} 个文件",
+                "detail": "复制校验完成",
+                "timestamp": item.get("_timestamp") or 0,
+            }
+        elif msg in ("archive plan ready", "archive match lock acquired"):
+            latest = {
+                "state": "running",
+                "match": current_match,
+                "metric": "准备中",
+                "detail": msg,
+                "timestamp": item.get("_timestamp") or 0,
+            }
+    return latest
+
+
+def read_json_log_events(path: Path, tail: int) -> list[dict]:
+    if not path.exists() or not path.is_file():
+        return []
+    result = run(["tail", "-n", str(tail), str(path)], timeout=4)
+    if not result["ok"]:
+        return []
+    events = []
+    for line in result["stdout"].splitlines():
+        fields = parse_json_log(line)
+        if not fields:
+            continue
+        fields["_timestamp"] = parse_timestamp_epoch(str(fields.get("time") or ""))
+        events.append(fields)
+    events.sort(key=lambda item: item.get("_timestamp") or 0)
+    return events
+
+
+def event_message(item: dict | None) -> str:
+    if not item:
+        return ""
+    return str(item.get("msg") or item.get("message") or "")
+
+
+def event_match(item: dict | None, matches_by_id: dict[str, dict]) -> dict | None:
+    if not item:
+        return None
+    match_id = str(item.get("match_id") or "")
+    return matches_by_id.get(match_id) if match_id else None
+
+
+def event_after_for_match(candidate: dict | None, reference: dict | None) -> bool:
+    if not candidate or not reference:
+        return False
+    candidate_match = str(candidate.get("match_id") or "")
+    reference_match = str(reference.get("match_id") or "")
+    if candidate_match and reference_match and candidate_match != reference_match:
+        return False
+    return (candidate.get("_timestamp") or 0) >= (reference.get("_timestamp") or 0)
+
+
+def biliup_checkpoint() -> dict:
+    path = Path(CONFIG.repo_root) / "download.log"
+    if not path.exists() or not path.is_file():
+        return {}
+    result = run(["tail", "-n", "300", str(path)], timeout=4)
+    if not result["ok"]:
+        return {}
+    checkpoint: dict[str, object] = {}
+    for line in result["stdout"].splitlines():
+        match = re.search(r"Upload completed: (.+?) => cost [^,]+, ([0-9.]+ MB/s)", line)
+        if match:
+            checkpoint["last_file"] = match.group(1)
+            checkpoint["speed"] = match.group(2)
+        match = re.search(r"Checkpoint saved: (\d+) files uploaded", line)
+        if match:
+            checkpoint["completed"] = int(match.group(1))
+        match = re.search(r'"name":"([^"]+)"', line)
+        if "pre_upload" in line and match:
+            checkpoint["current_file"] = match.group(1)
+        if "All files uploaded successfully" in line:
+            checkpoint["completed"] = None
+            checkpoint["current_file"] = ""
+            checkpoint["all_uploaded"] = True
+    return checkpoint
+
+
+def match_progress_label(item: dict) -> str:
+    zone = short_zone(str(item.get("zone") or ""))
+    stage = stage_label(str(item.get("match_type") or ""), str(item.get("match_slug") or ""))
+    prefix = f"{zone}第{item.get('order') or '?'}场"
+    if stage:
+        prefix = f"{prefix} {stage}"
+    red = team_label(str(item.get("red_school") or ""), str(item.get("red_name") or ""))
+    blue = team_label(str(item.get("blue_school") or ""), str(item.get("blue_name") or ""))
+    score = ""
+    if item.get("red_score") or item.get("blue_score") or item.get("latest_status") == "DONE":
+        score = f"{item.get('red_score', 0)}:{item.get('blue_score', 0)}"
+    versus = f"{red}{score or ' vs '}{blue}"
+    return f"{prefix} {versus}".strip()
+
+
+def short_zone(zone: str) -> str:
+    for token in ("赛区", "区域赛", "分区"):
+        zone = zone.replace(token, "")
+    return zone.strip()
+
+
+def stage_label(match_type: str, match_slug: str) -> str:
+    slug = match_slug.strip()
+    if slug and any("\u4e00" <= char <= "\u9fff" for char in slug):
+        return slug
+    labels = {
+        "GROUP": "小组赛",
+        "GROUP_STAGE": "小组赛",
+        "KNOCKOUT": "淘汰赛",
+        "KNOCKOUT_STAGE": "淘汰赛",
+        "ELIMINATION": "淘汰赛",
+        "PLAYOFF": "淘汰赛",
+        "PLAY_OFF": "淘汰赛",
+        "ROUND_OF_32": "1/16决赛",
+        "ROUND_OF_16": "1/8决赛",
+        "EIGHTH_FINAL": "1/8决赛",
+        "QUARTER_FINAL": "1/4决赛",
+        "SEMI_FINAL": "半决赛",
+        "FINAL": "决赛",
+        "GRAND_FINAL": "总决赛",
+        "THIRD_PLACE": "季军赛",
+        "BRONZE": "季军赛",
+        "TEST": "测试",
+    }
+    key = match_type.strip().upper().replace("-", "_").replace(" ", "_")
+    return labels.get(key, match_type.strip())
+
+
+def team_label(school: str, name: str) -> str:
+    return (school or name).strip()
+
+
+def human_bytes(bytes_value: int) -> str:
+    value = float(bytes_value or 0)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if value < 1024 or unit == "GiB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+    return f"{value:.1f} GiB"
 
 
 def storage_snapshot(mount: str) -> dict:
@@ -1142,6 +1515,45 @@ INDEX_HTML = r"""<!doctype html>
       align-items: start;
     }
     .panel { padding: 14px; overflow: hidden; }
+    .pipeline-panel { margin-bottom: 14px; }
+    .pipeline-grid {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .pipeline-step {
+      min-height: 132px;
+      padding: 13px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface-soft);
+    }
+    .pipeline-step.running { background: var(--blue-bg); border-color: #b9d8f2; }
+    .pipeline-step.done { background: var(--green-bg); border-color: #b6e3c9; }
+    .pipeline-step.warn { background: var(--amber-bg); border-color: #f0d595; }
+    .pipeline-step.bad { background: var(--red-bg); border-color: #f2b4ae; }
+    .pipeline-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .pipeline-status {
+      flex: 0 0 auto;
+      border-radius: 999px;
+      padding: 3px 8px;
+      font-size: 12px;
+      background: #eef2f7;
+      color: var(--muted);
+    }
+    .running .pipeline-status { background: #d8ebff; color: var(--blue); }
+    .done .pipeline-status { background: #dff4e8; color: var(--green); }
+    .warn .pipeline-status { background: #ffedc2; color: var(--amber); }
+    .bad .pipeline-status { background: #ffe0dd; color: var(--red); }
+    .pipeline-match {
+      margin-top: 12px;
+      min-height: 40px;
+      line-height: 1.35;
+      font-weight: 760;
+      overflow-wrap: anywhere;
+    }
+    .pipeline-metric { margin-top: 8px; font-size: 20px; line-height: 1.15; font-weight: 820; }
+    .pipeline-detail { margin-top: 7px; color: var(--muted); overflow-wrap: anywhere; }
     .checks {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -1272,12 +1684,13 @@ INDEX_HTML = r"""<!doctype html>
     @media (max-width: 1180px) {
       .headline { grid-template-columns: repeat(3, minmax(0, 1fr)); }
       .dashboard-grid { grid-template-columns: 1fr; }
+      .pipeline-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
       .checks, .diagnostics-grid, .history-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
     @media (max-width: 660px) {
       header { align-items: flex-start; flex-direction: column; padding: 12px 14px; }
       main { padding: 14px; }
-      .headline, .checks, .diagnostics-grid, .history-grid { grid-template-columns: 1fr; }
+      .headline, .pipeline-grid, .checks, .diagnostics-grid, .history-grid { grid-template-columns: 1fr; }
       .card.primary .value { font-size: 28px; }
       .toolbar, .diagnostics-toolbar { justify-content: flex-start; width: 100%; }
       input, select { min-width: 0; width: 100%; }
@@ -1308,6 +1721,10 @@ INDEX_HTML = r"""<!doctype html>
   </header>
   <main>
     <section id="headline" class="headline"></section>
+    <section class="panel pipeline-panel">
+      <h2>流程进度</h2>
+      <div id="pipeline-steps" class="pipeline-grid"></div>
+    </section>
     <section class="dashboard-grid">
       <section class="panel">
         <h2>环节状态</h2>
@@ -1359,6 +1776,7 @@ INDEX_HTML = r"""<!doctype html>
     const $ = (id) => document.getElementById(id);
     const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (ch) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
     const statusText = {ok: "正常", warn: "注意", bad: "异常"};
+    const pipelineText = {running: "进行中", done: "已完成", idle: "等待", warn: "注意", bad: "异常"};
 
     function worse(a, b) {
       const rank = {bad: 3, warn: 2, ok: 1};
@@ -1388,6 +1806,11 @@ INDEX_HTML = r"""<!doctype html>
 
     function check(label, cls, detail) {
       return `<div class="check ${esc(cls)}"><div class="check-head"><h3>${esc(label)}</h3><span class="status-pill">${esc(statusText[cls] || cls)}</span></div><div class="check-state">${esc(statusText[cls] || cls)}</div><div class="check-detail">${esc(detail)}</div></div>`;
+    }
+
+    function pipelineStep(item) {
+      const state = item.state || "idle";
+      return `<div class="pipeline-step ${esc(state)}"><div class="pipeline-head"><h3>${esc(item.label || "--")}</h3><span class="pipeline-status">${esc(pipelineText[state] || state)}</span></div><div class="pipeline-match">${esc(item.match_label || "暂无场次")}</div><div class="pipeline-metric">${esc(item.metric || "--")}</div><div class="pipeline-detail">${esc(item.detail || "")}</div></div>`;
     }
 
     function statusCount(group, ...names) {
@@ -1451,6 +1874,7 @@ INDEX_HTML = r"""<!doctype html>
       const issues = data.issues || [];
       const current = data.current || {};
       const history = data.history || {};
+      const pipeline = data.pipeline || {};
       const severity = summary.severity || "ok";
       $("health-dot").className = `dot ${severity}`;
       $("generated").textContent = `${data.generated_at || "--"} / ${data.namespace || ""} / ${data.duration_ms || 0} ms`;
@@ -1482,6 +1906,11 @@ INDEX_HTML = r"""<!doctype html>
         check("存储空间", storage, firstIssue(issues, ["存储"], storageLine(current))),
         check("告警信号", logSignal, (currentLevels.ERROR || currentLevels.WARN) ? `近 15 分钟 ERROR ${currentLevels.ERROR || 0}，WARN ${currentLevels.WARN || 0}` : "近 15 分钟无 ERROR/WARN"),
       ].join("");
+
+      const steps = pipeline.steps || [];
+      $("pipeline-steps").innerHTML = steps.length
+        ? steps.map(pipelineStep).join("")
+        : `<div class="empty">暂无流程数据</div>`;
 
       $("issues").innerHTML = issues.length
         ? issues.map(item => `<div class="issue-item ${esc(item.severity)}"><div class="issue-title">${esc(item.area)} · ${esc(item.title)}</div><div class="issue-detail">${esc(item.detail)}</div></div>`).join("")
