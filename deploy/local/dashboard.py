@@ -6,6 +6,7 @@ import subprocess
 import time
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -44,6 +45,9 @@ LEVELS = ["ERROR", "WARN", "INFO", "DEBUG", "OTHER"]
 CURRENT_LOG_SECONDS = 15 * 60
 LOCAL_ISSUE_SECONDS = 2 * 60 * 60
 JOB_ISSUE_SECONDS = 60 * 60
+COLLECT_WORKERS = 8
+LOG_RESPONSE_LIMIT = 150
+LOG_RESPONSE_FIELD_CHARS = 500
 CONFIG = None
 
 
@@ -121,6 +125,7 @@ def collect_logs(query: dict[str, list[str]]) -> dict:
     since = first_query(query, "since", CONFIG.default_since)
     level = first_query(query, "level", "ALL").upper()
     keyword = first_query(query, "q", "")
+    diagnostics = first_query(query, "diagnostics", "0").lower() in ("1", "true", "yes")
     tail = min(max(to_int(first_query(query, "tail", str(CONFIG.default_tail))), 20), 2000)
     if since not in LOG_SINCE_OPTIONS:
         since = CONFIG.default_since
@@ -131,38 +136,71 @@ def collect_logs(query: dict[str, list[str]]) -> dict:
     if target not in allowed:
         target = "all"
 
-    errors = []
-    raw_lines = []
-    for name, resolved in resolve_targets(target, errors):
-        raw_lines.extend(fetch_target_logs(name, resolved, since, tail, errors))
+    errors: list[dict] = []
+    include_logs = diagnostics or target != "all" or level != "ALL" or bool(keyword.strip())
+    with ThreadPoolExecutor(max_workers=COLLECT_WORKERS) as executor:
+        logs_future = executor.submit(collect_raw_logs, target, since, tail, errors) if include_logs else None
+        history_future = executor.submit(collect_history)
+        current_future = executor.submit(collect_current_snapshot)
+        pipeline_future = executor.submit(collect_pipeline_progress)
 
-    parsed_all = [parse_log_line(item["target"], item["line"]) for item in raw_lines]
+        raw_lines = logs_future.result() if logs_future else []
+        parsed_all = [parse_log_line(item["target"], item["line"]) for item in raw_lines]
+        issues_future = executor.submit(collect_issues, parsed_all, errors)
+
+        history = history_future.result()
+        current = current_future.result()
+        pipeline = pipeline_future.result()
+        issues = issues_future.result()
+
     parsed = apply_filters(parsed_all, level, keyword)
     parsed.sort(key=lambda item: item.get("time_sort") or "", reverse=True)
-    issues = collect_issues(parsed_all, errors)
     summary = summarize(parsed_all, errors, issues)
-    history = collect_history()
-    current = collect_current_snapshot()
-    pipeline = collect_pipeline_progress()
 
-    return {
+    response = {
         "generated_at": now_text(),
         "namespace": CONFIG.namespace,
+        "diagnostics": diagnostics,
         "target": target,
         "since": since,
         "level": level,
         "keyword": keyword,
         "tail": tail,
-        "targets": [{"name": name, "target": value} for name, value in LOG_TARGETS],
-        "summary": summary,
+        "summary": visible_summary(summary, diagnostics),
         "current": current,
         "history": history,
         "pipeline": pipeline,
         "issues": issues,
-        "lines": parsed[:1200],
-        "errors": errors,
         "duration_ms": int((time.time() - started) * 1000),
     }
+    if diagnostics:
+        response["targets"] = [{"name": name, "target": value} for name, value in LOG_TARGETS]
+        response["lines"] = [compact_log_line(item) for item in parsed[: min(LOG_RESPONSE_LIMIT, tail)]]
+        response["errors"] = errors
+    return response
+
+
+def collect_raw_logs(target: str, since: str, tail: int, errors: list[dict]) -> list[dict]:
+    resolved_targets = resolve_targets(target, errors)
+    if len(resolved_targets) <= 1:
+        return [
+            item
+            for name, resolved in resolved_targets
+            for item in fetch_target_logs(name, resolved, since, tail, errors)
+        ]
+    raw_lines: list[dict] = []
+    workers = min(COLLECT_WORKERS, len(resolved_targets))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(fetch_target_logs, name, resolved, since, tail, errors): name
+            for name, resolved in resolved_targets
+        }
+        for future in as_completed(futures):
+            try:
+                raw_lines.extend(future.result())
+            except Exception as exc:
+                errors.append({"label": futures[future], "message": str(exc)})
+    return raw_lines
 
 
 def resolve_targets(target: str, errors: list[dict]) -> list[tuple[str, str]]:
@@ -290,6 +328,24 @@ def parse_log_line(target: str, line: str) -> dict:
         "message": message,
         "raw": text,
     }
+
+
+def compact_log_line(item: dict) -> dict:
+    return {
+        "time": item.get("time", ""),
+        "time_sort": item.get("time_sort", ""),
+        "target": item.get("target", ""),
+        "level": item.get("level", ""),
+        "category": item.get("category", ""),
+        "message": truncate_text(str(item.get("message") or ""), LOG_RESPONSE_FIELD_CHARS),
+        "raw": truncate_text(str(item.get("raw") or ""), LOG_RESPONSE_FIELD_CHARS),
+    }
+
+
+def truncate_text(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return value[: limit - 1] + "…"
 
 
 def split_kube_timestamp(line: str) -> tuple[str, str]:
@@ -639,7 +695,6 @@ def collect_pipeline_progress() -> dict:
             upload_pipeline_step(by_id),
             cleanup_pipeline_step(by_id),
         ],
-        "matches": matches,
     }
 
 
@@ -1022,16 +1077,33 @@ def biliup_checkpoint() -> dict:
         line_ts = log_line_epoch(line)
         if all_uploaded_ts and line_ts and line_ts < all_uploaded_ts:
             continue
+        match = re.search(r"Found checkpoint with (\d+) uploaded files", line)
+        if match:
+            checkpoint["completed"] = int(match.group(1))
+            checkpoint["current_file"] = ""
+            checkpoint.pop("all_uploaded", None)
+            checkpoint.pop("submit_completed", None)
+        if "No checkpoint found, starting fresh upload" in line:
+            checkpoint["completed"] = 0
+            checkpoint["current_file"] = ""
+            checkpoint.pop("all_uploaded", None)
+            checkpoint.pop("submit_completed", None)
         match = re.search(r"Upload completed: (.+?) => cost [^,]+, ([0-9.]+ MB/s)", line)
         if match:
             checkpoint["last_file"] = match.group(1)
             checkpoint["speed"] = match.group(2)
+            checkpoint.pop("all_uploaded", None)
+            checkpoint.pop("submit_completed", None)
         match = re.search(r"Checkpoint saved: (\d+) files uploaded", line)
         if match:
             checkpoint["completed"] = int(match.group(1))
+            checkpoint.pop("all_uploaded", None)
+            checkpoint.pop("submit_completed", None)
         match = re.search(r'"name":"([^"]+)"', line)
         if "pre_upload" in line and match:
             checkpoint["current_file"] = match.group(1)
+            checkpoint.pop("all_uploaded", None)
+            checkpoint.pop("submit_completed", None)
         if "All files uploaded successfully" in line:
             checkpoint["completed"] = None
             checkpoint["current_file"] = ""
@@ -1426,6 +1498,26 @@ def summarize(lines: list[dict], errors: list[dict], issues: list[dict]) -> dict
         "bad_issues": bad_issues,
         "warn_issues": warn_issues,
     }
+
+
+def visible_summary(summary: dict, diagnostics: bool) -> dict:
+    fields = {
+        "severity": summary.get("severity", "ok"),
+        "bad_issues": summary.get("bad_issues", 0),
+        "warn_issues": summary.get("warn_issues", 0),
+        "errors": summary.get("errors", 0),
+    }
+    if diagnostics:
+        fields.update(
+            {
+                "total": summary.get("total", 0),
+                "by_level": summary.get("by_level", {}),
+                "current_by_level": summary.get("current_by_level", {}),
+                "by_target": summary.get("by_target", {}),
+                "by_category": summary.get("by_category", {}),
+            }
+        )
+    return fields
 
 
 def first_query(query: dict[str, list[str]], key: str, default: str) -> str:
@@ -1975,7 +2067,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function render(data) {
-      syncTargets(data.targets || []);
+      if (data.targets) syncTargets(data.targets);
       const summary = data.summary || {};
       const levels = summary.by_level || {};
       const currentLevels = summary.current_by_level || {};
@@ -2030,14 +2122,17 @@ INDEX_HTML = r"""<!doctype html>
       const artifacts = history.artifacts || {};
       const sourceArtifact = ((artifacts.by_kind || {}).source) || {};
       const scripts = history.local_scripts || {};
-      $("history-metrics").innerHTML = [
+      const historyCards = [
         stat("录制任务", records.total || 0, `成功 ${statusCount(records, "SUCCEEDED")}，失败 ${statusCount(records, "FAILED")}，进行中 ${statusCount(records, "RUNNING", "DISPATCHING", "PENDING")}`),
         stat("上传任务", uploads.total || 0, `成功 ${statusCount(uploads, "SUCCEEDED")}，失败 ${statusCount(uploads, "FAILED")}，等待 ${statusCount(uploads, "PENDING", "DISPATCHING")}`),
         stat("转码任务", transcodes.total || 0, `成功 ${statusCount(transcodes, "SUCCEEDED")}，失败 ${statusCount(transcodes, "FAILED")}`),
         stat("源文件", sourceArtifact.count || 0, `今日新增 ${formatBytes(sourceArtifact.bytes || 0)}`),
         stat("脚本事件", scripts.total || 0, `ERROR ${scripts.ERROR || 0}，WARN ${scripts.WARN || 0}`),
-        stat("日志窗口", summary.total || 0, `${data.since === "today" ? "今天" : data.since} 采样日志，ERROR ${levels.ERROR || 0}，WARN ${levels.WARN || 0}`),
-      ].join("");
+      ];
+      if (data.diagnostics) {
+        historyCards.push(stat("日志窗口", summary.total || 0, `${data.since === "today" ? "今天" : data.since} 采样日志，ERROR ${levels.ERROR || 0}，WARN ${levels.WARN || 0}`));
+      }
+      $("history-metrics").innerHTML = historyCards.join("");
 
       $("level-bars").innerHTML = barList(levels, ["ERROR", "WARN", "INFO", "DEBUG", "OTHER"]);
       $("category-bars").innerHTML = barList(summary.by_category || {}, ["record", "upload", "live", "transcode", "db", "system"]);
@@ -2055,7 +2150,8 @@ INDEX_HTML = r"""<!doctype html>
         since: $("since").value || "today",
         level: diagnosticsOpen ? ($("level").value || "ALL") : "ALL",
         q: diagnosticsOpen ? ($("keyword").value || "") : "",
-        tail: diagnosticsOpen ? "500" : "120",
+        diagnostics: diagnosticsOpen ? "1" : "0",
+        tail: diagnosticsOpen ? "150" : "120",
         t: Date.now().toString(),
       });
       try {
