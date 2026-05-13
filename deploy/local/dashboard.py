@@ -23,6 +23,7 @@ LOG_TARGETS = [
     ("monitor", "deployment/monitor"),
     ("record-dispatcher", "deployment/record-dispatcher"),
     ("record-job", "job-prefix/record-"),
+    ("continuous-cache", "job-prefix/continuous-cache-"),
     ("uploader-dispatcher", "deployment/uploader-dispatcher"),
     ("uploader-job", "job-prefix/upload-"),
     ("lark-notifier", "deployment/lark-notifier"),
@@ -31,8 +32,10 @@ LOG_TARGETS = [
     ("postgres", "deployment/postgres"),
     ("redis", "deployment/redis"),
     ("local-biliup", "local-log/biliup-upload"),
+    ("local-archive-auto", "local-log/archive-auto-queue"),
     ("local-archive", "local-log/archive-artifacts"),
     ("local-emergency-record", "local-log/emergency-record"),
+    ("local-continuous-cache", "local-log/continuous-cache"),
     ("biliup-download.log", "local-file/download.log"),
     ("biliup-ds_update.log", "local-file/ds_update.log"),
 ]

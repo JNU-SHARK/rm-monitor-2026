@@ -20,12 +20,16 @@ import local_log
 
 DEFAULT_RECORDS_ROOT = "/mnt/PC801/rm-monitor/records"
 DEFAULT_ARCHIVE_TARGET_ROOT = "/mnt/server_data/rm-monitor/records"
+DEFAULT_CONTINUOUS_CACHE_ROOT = "/mnt/PC801/rm-monitor/records/_continuous_cache"
 DEFAULT_COOKIE = "cookies.json"
 DEFAULT_TITLE_SUFFIX = "RMUC2026区域赛"
 DEFAULT_TAGS = "RoboMaster,RMUC2026,机器人竞赛"
 DEFAULT_SEASON_NAME = "RMUC2026南部赛区录制"
+DEFAULT_COPYRIGHT = "2"
+DEFAULT_REPOST_SOURCE = "RoboMaster 官方直播"
 DEFAULT_BITABLE_LINK_FIELD = "视频链接"
 DEFAULT_LARK_SECRET_NAME = "rm-monitor-lark"
+DEFAULT_SCHEDULE_URL = "https://pro-robomasters-hz-n5i3.oss-cn-hangzhou.aliyuncs.com/live_json/schedule.json"
 FEISHU_API_BASE = "https://open.feishu.cn/open-apis"
 BITABLE_FIELD_TYPE_TEXT = 1
 BITABLE_FIELD_TYPE_URL = 15
@@ -111,11 +115,14 @@ def main() -> int:
     parser.add_argument("--archive-source-root", default="", help="Source root for post-upload archive. Defaults to --records-root.")
     parser.add_argument("--no-archive-after-upload", action="store_true", help="Do not copy to long-term storage after a successful submit.")
     parser.add_argument("--keep-source-after-archive", action="store_true", help="Keep source files after verified long-term copy.")
+    parser.add_argument("--continuous-cache-root", default=DEFAULT_CONTINUOUS_CACHE_ROOT, help="A/B continuous cache root cleaned after successful archive.")
+    parser.add_argument("--cleanup-continuous-cache", action="store_true", help="Clean A/B continuous cache segments after upload and long-term archive both succeed.")
+    parser.add_argument("--keep-continuous-cache-after-archive", action="store_true", help="Deprecated compatibility flag. Continuous cache cleanup is disabled unless --cleanup-continuous-cache is set.")
     parser.add_argument("--cookie", default=DEFAULT_COOKIE, help="biliup cookies.json path.")
     parser.add_argument("--biliup", default="biliup", help="biliup executable.")
     parser.add_argument("--tid", default="171", help="Bilibili category id. 171 is e-sports.")
-    parser.add_argument("--copyright", default="1", help="1 self-made, 2 repost.")
-    parser.add_argument("--source", default="", help="Repost source when copyright=2.")
+    parser.add_argument("--copyright", default=DEFAULT_COPYRIGHT, help="1 self-made, 2 repost.")
+    parser.add_argument("--source", default=DEFAULT_REPOST_SOURCE, help="Repost source when copyright=2.")
     parser.add_argument("--line", default="", help="Upload line, for example bda2/tx.")
     parser.add_argument("--limit", default="3", help="Per-file upload concurrency.")
     parser.add_argument("--tags", default=DEFAULT_TAGS)
@@ -135,6 +142,8 @@ def main() -> int:
     parser.add_argument("--lark-app-secret", default="", help="Feishu app secret. Defaults to env or Kubernetes secret.")
     parser.add_argument("--bitable-app-token", default="", help="Feishu Bitable app token fallback.")
     parser.add_argument("--lark-secret-name", default=DEFAULT_LARK_SECRET_NAME, help="Kubernetes secret containing app-id/app-secret/bitable-app-token.")
+    parser.add_argument("--schedule-url", default=DEFAULT_SCHEDULE_URL, help="Official schedule JSON used as the upload source of truth.")
+    parser.add_argument("--allow-stale-match-data", action="store_true", help="Allow upload to continue with database match data if official schedule fetch/match fails.")
     parser.add_argument("--add-existing-bvid", help="Skip upload and add an existing BV id to the selected collection.")
     parser.add_argument("--submit", action="store_true", help="Actually run biliup. Without this, only print the plan.")
     parser.add_argument("--allow-duplicates", action="store_true", help="Allow multiple files with the same role.")
@@ -149,6 +158,7 @@ def main() -> int:
         order=args.order,
         add_existing_bvid=args.add_existing_bvid or "",
         archive_after_upload=not args.no_archive_after_upload,
+        cleanup_continuous_cache=args.cleanup_continuous_cache and not args.keep_continuous_cache_after_archive,
         feishu_link=not args.no_feishu_link,
         feishu_topic_reply=not args.no_feishu_topic_reply,
     )
@@ -162,6 +172,8 @@ def main() -> int:
         artifacts = []
         bitable_records = []
         match_info = load_match(args) if has_match_selector(args) else None
+        if match_info is not None:
+            match_info, _ = refresh_match_from_schedule(args, match_info)
         if match_info is not None and (not args.no_feishu_link or not args.no_archive_after_upload):
             artifacts = load_artifacts(args, match_info.match_id, args.allow_duplicates)
         if not args.no_feishu_link and match_info is not None:
@@ -184,7 +196,11 @@ def main() -> int:
                         "enabled": match_info is not None and not args.no_archive_after_upload,
                         "source_root": args.archive_source_root or args.records_root,
                         "target_root": args.archive_target_root,
-                        "delete_source": not args.keep_source_after_archive,
+                        "delete_source": "after_bilibili_and_archive_success" if not args.keep_source_after_archive else False,
+                    },
+                    "continuous_cache_cleanup": {
+                        "enabled": args.cleanup_continuous_cache and not args.keep_continuous_cache_after_archive,
+                        "cache_root": args.continuous_cache_root,
                     },
                     "submit": args.submit,
                 },
@@ -232,7 +248,7 @@ def main() -> int:
             if match_info is not None and not args.no_feishu_topic_reply:
                 reply_feishu_bilibili_link(args, match_info, args.add_existing_bvid)
             if match_info is not None and not args.no_archive_after_upload:
-                archive_after_upload(args, match_info)
+                run_archive_and_cleanup_after_upload(args, match_info)
             local_log.log_event(
                 "biliup-upload",
                 "INFO",
@@ -243,6 +259,7 @@ def main() -> int:
         return 0
 
     match_info = load_match(args)
+    match_info, match_data_source = refresh_match_from_schedule(args, match_info)
     artifacts = load_artifacts(args, match_info.match_id, args.allow_duplicates)
     video_paths = resolve_video_paths(Path(args.records_root), artifacts)
     title = args.title or build_title(match_info, args.title_suffix, not args.no_stage_in_title)
@@ -254,6 +271,7 @@ def main() -> int:
         "match_id": match_info.match_id,
         "match_type": match_info.match_type,
         "stage": stage_label(match_info),
+        "match_data_source": match_data_source,
         "title": title,
         "season": None if season is None else season.__dict__,
         "feishu": {
@@ -265,9 +283,14 @@ def main() -> int:
         "videos": [{"role": artifact.role, "path": str(path)} for artifact, path in zip(artifacts, video_paths)],
         "archive_after_upload": {
             "enabled": not args.no_archive_after_upload,
+            "mode": "parallel_with_bilibili_upload",
             "source_root": args.archive_source_root or args.records_root,
             "target_root": args.archive_target_root,
-            "delete_source": not args.keep_source_after_archive,
+            "delete_source": "after_bilibili_and_archive_success" if not args.keep_source_after_archive else False,
+        },
+        "continuous_cache_cleanup": {
+            "enabled": args.cleanup_continuous_cache and not args.keep_continuous_cache_after_archive,
+            "cache_root": args.continuous_cache_root,
         },
         "submit": args.submit,
     }
@@ -305,6 +328,10 @@ def main() -> int:
                 args.bitable_link_field,
             )
 
+    archive_process = None
+    if not args.no_archive_after_upload:
+        archive_process = start_archive_copy(args, match_info)
+
     before = set(find_bvids_by_title(session, title))
     local_log.log_event(
         "biliup-upload",
@@ -316,6 +343,8 @@ def main() -> int:
     )
     code, upload_output = run_streaming(command)
     if code != 0:
+        if archive_process is not None:
+            wait_archive_copy(args, match_info, archive_process)
         local_log.log_event(
             "biliup-upload",
             "ERROR",
@@ -352,7 +381,8 @@ def main() -> int:
     if not args.no_feishu_topic_reply:
         reply_feishu_bilibili_link(args, match_info, bvid)
     if not args.no_archive_after_upload:
-        archive_after_upload(args, match_info)
+        wait_archive_copy_or_exit(args, match_info, archive_process)
+        delete_sources_and_optional_cache(args, match_info)
     local_log.log_event(
         "biliup-upload",
         "INFO",
@@ -426,6 +456,119 @@ def load_match(args: argparse.Namespace) -> MatchInfo:
         red_score=int(row[10]),
         blue_score=int(row[11]),
     )
+
+
+def refresh_match_from_schedule(args: argparse.Namespace, match_info: MatchInfo) -> tuple[MatchInfo, dict[str, str]]:
+    if not args.schedule_url:
+        return match_info, {"source": "database", "reason": "schedule URL disabled"}
+    try:
+        official = load_official_match(args.schedule_url, match_info)
+    except Exception as exc:
+        if args.allow_stale_match_data:
+            local_log.log_event(
+                "biliup-upload",
+                "WARNING",
+                "official schedule refresh failed; using database match data",
+                match_id=match_info.match_id,
+                error=str(exc),
+            )
+            return match_info, {"source": "database", "reason": f"official schedule failed: {exc}"}
+        local_log.log_event(
+            "biliup-upload",
+            "ERROR",
+            "official schedule refresh failed before upload",
+            match_id=match_info.match_id,
+            error=str(exc),
+        )
+        send_feishu_alert(
+            args,
+            "Bilibili 上传前赛程刷新失败",
+            f"比赛：{match_info.zone} 第{match_info.order}场\n原因：{exc}\n已中止上传，请立即提醒席伟杰修复。",
+        )
+        raise SystemExit(f"official schedule refresh failed before upload: {exc}") from exc
+    if official is None:
+        message = f"match {match_info.match_id} ({match_info.zone} #{match_info.order}) not found in official schedule"
+        if args.allow_stale_match_data:
+            local_log.log_event(
+                "biliup-upload",
+                "WARNING",
+                "official schedule match missing; using database match data",
+                match_id=match_info.match_id,
+                zone=match_info.zone,
+                order=match_info.order,
+            )
+            return match_info, {"source": "database", "reason": message}
+        local_log.log_event(
+            "biliup-upload",
+            "ERROR",
+            "official schedule match missing before upload",
+            match_id=match_info.match_id,
+            zone=match_info.zone,
+            order=match_info.order,
+        )
+        send_feishu_alert(
+            args,
+            "Bilibili 上传前赛程刷新失败",
+            f"比赛：{match_info.zone} 第{match_info.order}场\n原因：{message}\n已中止上传，请立即提醒席伟杰修复。",
+        )
+        raise SystemExit(message)
+    if (official.red_score, official.blue_score) != (match_info.red_score, match_info.blue_score):
+        local_log.log_event(
+            "biliup-upload",
+            "WARNING",
+            "database score differs from official schedule; using official score",
+            match_id=match_info.match_id,
+            database_score=f"{match_info.red_score}:{match_info.blue_score}",
+            official_score=f"{official.red_score}:{official.blue_score}",
+        )
+    return official, {"source": "official_schedule", "url": args.schedule_url}
+
+
+def load_official_match(schedule_url: str, match_info: MatchInfo) -> MatchInfo | None:
+    response = requests.get(schedule_url, headers={"User-Agent": "rm-monitor-biliup/1.0"}, timeout=15)
+    response.raise_for_status()
+    data = response.json()
+    event = data.get("data", {}).get("event", {})
+    event_title = str(event.get("title") or match_info.event)
+    for zone_node in event.get("zones", {}).get("nodes", []) or []:
+        zone = str(zone_node.get("name") or "")
+        matches = list(zone_node.get("groupMatches", {}).get("nodes", []) or [])
+        matches.extend(zone_node.get("knockoutMatches", {}).get("nodes", []) or [])
+        for item in matches:
+            if str(item.get("id") or "") != match_info.match_id:
+                continue
+            red_score = required_int(item, "redSideWinGameCount")
+            blue_score = required_int(item, "blueSideWinGameCount")
+            red_team = team_from_schedule(item.get("redSide", {}), match_info.red_school, match_info.red_name)
+            blue_team = team_from_schedule(item.get("blueSide", {}), match_info.blue_school, match_info.blue_name)
+            return MatchInfo(
+                match_id=str(item.get("id") or match_info.match_id),
+                event=event_title,
+                zone=zone or match_info.zone,
+                order=int(item.get("orderNumber") or match_info.order),
+                match_type=str(item.get("matchType") or match_info.match_type),
+                match_slug=str(item.get("slug") or match_info.match_slug or ""),
+                red_school=red_team[0],
+                red_name=red_team[1],
+                blue_school=blue_team[0],
+                blue_name=blue_team[1],
+                red_score=red_score,
+                blue_score=blue_score,
+            )
+    return None
+
+
+def team_from_schedule(side: dict, fallback_school: str, fallback_name: str) -> tuple[str, str]:
+    player = side.get("player", {}) or {}
+    team = player.get("team", {}) or {}
+    return str(team.get("collegeName") or fallback_school), str(team.get("name") or fallback_name)
+
+
+def required_int(node: dict, key: str) -> int:
+    value = node.get(key)
+    if value is None or value == "":
+        raise ValueError(f"official schedule missing {key}")
+    return int(value)
 
 
 def load_artifacts(args: argparse.Namespace, match_id: str, allow_duplicates: bool) -> list[Artifact]:
@@ -566,7 +709,7 @@ def run_streaming(command: list[str]) -> tuple[int, str]:
     return process.wait(), "".join(output)
 
 
-def archive_after_upload(args: argparse.Namespace, match_info: MatchInfo) -> None:
+def archive_command(args: argparse.Namespace, match_info: MatchInfo, *, delete_source: bool = False, delete_source_only: bool = False) -> list[str]:
     script = Path(__file__).with_name("archive_match_artifacts.py")
     command = [
         sys.executable,
@@ -587,24 +730,50 @@ def archive_after_upload(args: argparse.Namespace, match_info: MatchInfo) -> Non
         args.archive_target_root,
         "--submit",
     ]
-    if not args.keep_source_after_archive:
+    if delete_source:
         command.append("--delete-source")
-    print("post-upload archive:", shell_join(command), file=sys.stderr)
+    if delete_source_only:
+        command.append("--delete-source-only")
+    return command
+
+
+def run_archive_and_cleanup_after_upload(args: argparse.Namespace, match_info: MatchInfo) -> None:
+    process = start_archive_copy(args, match_info)
+    wait_archive_copy_or_exit(args, match_info, process)
+    delete_sources_and_optional_cache(args, match_info)
+
+
+def start_archive_copy(args: argparse.Namespace, match_info: MatchInfo):
+    command = archive_command(args, match_info)
+    print("long-term archive copy:", shell_join(command), file=sys.stderr)
     local_log.log_event(
         "biliup-upload",
         "INFO",
-        "post-upload archive started",
+        "long-term archive copy started",
         match_id=match_info.match_id,
         source_root=args.archive_source_root or args.records_root,
         target_root=args.archive_target_root,
-        delete_source=not args.keep_source_after_archive,
+        delete_source=False,
     )
-    code, _ = run_streaming(command)
+    return subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=os.environ.copy(),
+    )
+
+
+def wait_archive_copy(args: argparse.Namespace, match_info: MatchInfo, process) -> int:
+    output, _ = process.communicate()
+    if output:
+        print(output, end="")
+    code = process.returncode
     if code != 0:
         local_log.log_event(
             "biliup-upload",
             "ERROR",
-            "post-upload archive failed",
+            "long-term archive copy failed",
             match_id=match_info.match_id,
             exit_code=code,
             source_root=args.archive_source_root or args.records_root,
@@ -615,13 +784,112 @@ def archive_after_upload(args: argparse.Namespace, match_info: MatchInfo) -> Non
             "长期归档失败",
             f"比赛：{match_info.zone} 第{match_info.order}场\n返回码：{code}\n请立即提醒席伟杰修复。源文件仍在 {args.archive_source_root or args.records_root}",
         )
-        raise SystemExit(code)
+        return code
     local_log.log_event(
         "biliup-upload",
         "INFO",
-        "post-upload archive completed",
+        "long-term archive copy completed",
         match_id=match_info.match_id,
         target_root=args.archive_target_root,
+    )
+    return 0
+
+
+def wait_archive_copy_or_exit(args: argparse.Namespace, match_info: MatchInfo, process) -> None:
+    if process is None:
+        return
+    code = wait_archive_copy(args, match_info, process)
+    if code != 0:
+        raise SystemExit(code)
+
+
+def delete_sources_and_optional_cache(args: argparse.Namespace, match_info: MatchInfo) -> None:
+    if not args.keep_source_after_archive:
+        command = archive_command(args, match_info, delete_source=True, delete_source_only=True)
+        print("delete local sources after upload and archive:", shell_join(command), file=sys.stderr)
+        local_log.log_event(
+            "biliup-upload",
+            "INFO",
+            "local source deletion started after upload and archive",
+            match_id=match_info.match_id,
+            source_root=args.archive_source_root or args.records_root,
+            target_root=args.archive_target_root,
+        )
+        code, _ = run_streaming(command)
+        if code != 0:
+            local_log.log_event(
+                "biliup-upload",
+                "ERROR",
+                "local source deletion failed after upload and archive",
+                match_id=match_info.match_id,
+                exit_code=code,
+            )
+            send_feishu_alert(
+                args,
+                "本地源文件清理失败",
+                f"比赛：{match_info.zone} 第{match_info.order}场\n返回码：{code}\n请提醒席伟杰检查。源文件仍在 {args.archive_source_root or args.records_root}",
+            )
+            raise SystemExit(code)
+        local_log.log_event(
+            "biliup-upload",
+            "INFO",
+            "local source deletion completed after upload and archive",
+            match_id=match_info.match_id,
+        )
+    if args.cleanup_continuous_cache and not args.keep_continuous_cache_after_archive:
+        cleanup_continuous_cache(args, match_info)
+
+
+def cleanup_continuous_cache(args: argparse.Namespace, match_info: MatchInfo) -> None:
+    script = Path(__file__).with_name("cleanup_continuous_cache.py")
+    command = [
+        sys.executable,
+        str(script),
+        "--match-id",
+        match_info.match_id,
+        "--namespace",
+        args.namespace,
+        "--postgres",
+        args.postgres,
+        "--db-user",
+        args.db_user,
+        "--db-name",
+        args.db_name,
+        "--cache-root",
+        args.continuous_cache_root,
+        "--submit",
+        "--enabled",
+    ]
+    print("post-archive continuous cache cleanup:", shell_join(command), file=sys.stderr)
+    local_log.log_event(
+        "biliup-upload",
+        "INFO",
+        "continuous cache cleanup started",
+        match_id=match_info.match_id,
+        cache_root=args.continuous_cache_root,
+    )
+    code, _ = run_streaming(command)
+    if code != 0:
+        local_log.log_event(
+            "biliup-upload",
+            "WARNING",
+            "continuous cache cleanup failed",
+            match_id=match_info.match_id,
+            exit_code=code,
+            cache_root=args.continuous_cache_root,
+        )
+        send_feishu_alert(
+            args,
+            "连续缓存清理失败",
+            f"比赛：{match_info.zone} 第{match_info.order}场\n返回码：{code}\n请提醒席伟杰检查。缓存仍在 {args.continuous_cache_root}",
+        )
+        return
+    local_log.log_event(
+        "biliup-upload",
+        "INFO",
+        "continuous cache cleanup completed",
+        match_id=match_info.match_id,
+        cache_root=args.continuous_cache_root,
     )
 
 
@@ -725,7 +993,21 @@ def load_archive_detail(args: argparse.Namespace, bvid: str) -> dict:
     )
     if result.returncode != 0:
         raise SystemExit(result.stderr.strip() or result.stdout.strip() or f"biliup show {bvid} failed")
-    return json.loads(result.stdout)
+    return parse_json_from_output(result.stdout, f"biliup show {bvid}")
+
+
+def parse_json_from_output(output: str, label: str) -> dict:
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(output):
+        if char not in "{[":
+            continue
+        try:
+            value, _ = decoder.raw_decode(output[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    raise SystemExit(f"{label} did not return JSON")
 
 
 def add_archive_to_season(session: requests.Session, csrf: str, season: SeasonInfo, detail: dict) -> None:

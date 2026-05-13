@@ -217,14 +217,16 @@ func (l *MatchScanLogic) upsertTeam(t scannedTeam) error {
 func (l *MatchScanLogic) reconcileRounds(prev processedSnapshot, cur scannedMatch) error {
 	prevTotal := prev.RedWinGameCount + prev.BlueWinGameCount
 	curTotal := cur.RedWinGameCount + cur.BlueWinGameCount
-	if prev.Status == types.MatchStatusSTARTED {
-		endTo := curTotal
-		if cur.Status != types.MatchStatusSTARTED && endTo == prevTotal {
-			endTo = prevTotal + 1
-		}
-		if cur.TotalRounds > 0 && endTo > cur.TotalRounds {
-			endTo = cur.TotalRounds
-		}
+	endTo := prevTotal
+	if curTotal > prevTotal {
+		endTo = curTotal
+	} else if prev.Status == types.MatchStatusSTARTED && cur.Status != types.MatchStatusSTARTED {
+		endTo = prevTotal + 1
+	}
+	if cur.TotalRounds > 0 && endTo > cur.TotalRounds {
+		endTo = cur.TotalRounds
+	}
+	if endTo > prevTotal {
 		winners := winnersFromDelta(prev, cur, endTo-prevTotal)
 		for roundNo := prevTotal + 1; roundNo <= endTo; roundNo++ {
 			if err := l.ensureEndedRound(cur.ID, roundNo, winners[roundNo-(prevTotal+1)]); err != nil {
@@ -301,6 +303,15 @@ func (l *MatchScanLogic) ensureEndedRound(matchID string, roundNo int, winner ma
 		return db.Notify(l.ctx, l.svcCtx.Config.PostgresConf.DSN, db.MatchRoundChangedChannel, strconv.Itoa(created.ID))
 	}
 	if r.Status == matchround.StatusENDED {
+		if r.Winner == nil || *r.Winner != winner {
+			if err := l.svcCtx.DB.MatchRound.UpdateOneID(r.ID).
+				SetWinner(winner).
+				Exec(l.ctx); err != nil {
+				return errors.Wrap(err, "update ended round winner")
+			}
+			l.Warnf("match round winner corrected match_id=%s round=%d old_winner=%v new_winner=%s", matchID, roundNo, r.Winner, winner)
+			return db.Notify(l.ctx, l.svcCtx.Config.PostgresConf.DSN, db.MatchRoundChangedChannel, strconv.Itoa(r.ID))
+		}
 		return nil
 	}
 	if err := l.svcCtx.DB.MatchRound.UpdateOneID(r.ID).

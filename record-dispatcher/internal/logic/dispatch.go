@@ -31,6 +31,8 @@ type DispatchLogic struct {
 }
 
 const dispatchingStaleAfter = 5 * time.Minute
+const continuationRetryAfter = 60 * time.Second
+const finalizeAfterRecordStable = 5 * time.Minute
 const manifestLookback = 30 * time.Second
 const matchStatusStarted = "STARTED"
 const partRoleMarker = "__part"
@@ -95,7 +97,10 @@ func shouldCancelRecordTask(task *ent.RecordTask) bool {
 	if round.Edges.Match == nil {
 		return round.Status == matchround.StatusENDED
 	}
-	return round.Edges.Match.LatestStatus != matchStatusStarted
+	if round.Edges.Match.LatestStatus == matchStatusStarted {
+		return false
+	}
+	return true
 }
 
 func (l *DispatchLogic) recoverDispatchingTasks() error {
@@ -111,7 +116,7 @@ func (l *DispatchLogic) recoverDispatchingTasks() error {
 	}
 	namespace := l.svcCtx.Config.K8sJobConf.WithDefaults().Namespace
 	for _, task := range tasks {
-		name := jobName("record", task.ID)
+		name := jobName("record", task.ID, task.Attempts)
 		if task.K8sJobName != nil && *task.K8sJobName != "" {
 			name = *task.K8sJobName
 		}
@@ -215,7 +220,10 @@ func (l *DispatchLogic) recordBaseRolesForMatch(matchID string) (map[string]bool
 
 func (l *DispatchLogic) createContinuationTasks() error {
 	matches, err := l.svcCtx.DB.Match.Query().
-		Where(match.LatestStatusEQ(matchStatusStarted)).
+		Where(match.Or(
+			match.LatestStatusEQ(matchStatusStarted),
+			match.HasRoundsWith(matchround.StatusEQ(matchround.StatusSTARTED)),
+		)).
 		WithRedTeam().
 		WithBlueTeam().
 		WithRounds(func(q *ent.MatchRoundQuery) {
@@ -229,8 +237,11 @@ func (l *DispatchLogic) createContinuationTasks() error {
 	}
 	conf := l.svcCtx.Config.RecordConf.WithDefaults()
 	for _, m := range matches {
-		startedRound := firstStartedRound(m.Edges.Rounds)
-		if startedRound == nil {
+		targetRound := firstStartedRound(m.Edges.Rounds)
+		if targetRound == nil && m.LatestStatus == matchStatusStarted {
+			targetRound = lastRound(m.Edges.Rounds)
+		}
+		if targetRound == nil {
 			continue
 		}
 		parts := collectPartState(m.Edges.Rounds)
@@ -246,6 +257,10 @@ func (l *DispatchLogic) createContinuationTasks() error {
 			if state.active || state.maxPart <= 0 {
 				continue
 			}
+			if state.lastStatus != recordtask.StatusSUCCEEDED &&
+				(state.lastStatus != recordtask.StatusFAILED || time.Since(state.lastUpdatedAt) < continuationRetryAfter) {
+				continue
+			}
 			url := urls[role]
 			if url == "" {
 				l.Errorf("continuation source missing match_id=%s zone=%s order=%d role=%s", m.ID, m.Zone, m.Order, role)
@@ -257,7 +272,7 @@ func (l *DispatchLogic) createContinuationTasks() error {
 				return err
 			}
 			err = l.svcCtx.DB.RecordTask.Create().
-				SetMatchRoundID(startedRound.ID).
+				SetMatchRoundID(targetRound.ID).
 				SetRole(partRole(role, nextPart)).
 				SetSourceURL(url).
 				SetOutputPath(output).
@@ -295,6 +310,9 @@ func (l *DispatchLogic) createMergeTasksForEndedMatches() error {
 	}
 	conf := l.svcCtx.Config.RecordConf.WithDefaults()
 	for _, m := range matches {
+		if firstStartedRound(m.Edges.Rounds) != nil {
+			continue
+		}
 		if len(m.Edges.Rounds) == 0 {
 			continue
 		}
@@ -307,12 +325,18 @@ func (l *DispatchLogic) createMergeTasksForEndedMatches() error {
 			if state.active || state.availableParts == 0 {
 				continue
 			}
+			if !state.lastUpdatedAt.IsZero() && time.Since(state.lastUpdatedAt) < finalizeAfterRecordStable {
+				continue
+			}
 			output, err := l.outputPath(conf, m, 1, role)
 			if err != nil {
 				return err
 			}
 			if final, ok := existingFinal[role]; ok {
-				if final.Status != recordtask.StatusFAILED {
+				if isActiveRecordStatus(final.Status) {
+					continue
+				}
+				if final.Status != recordtask.StatusFAILED && !finalNeedsRefresh(final, state) {
 					continue
 				}
 				if err := l.svcCtx.DB.RecordTask.UpdateOneID(final.ID).
@@ -320,6 +344,7 @@ func (l *DispatchLogic) createMergeTasksForEndedMatches() error {
 					SetOutputPath(output).
 					SetStatus(recordtask.StatusPENDING).
 					ClearErrorMessage().
+					ClearCompletedAt().
 					Exec(l.ctx); err != nil {
 					return errors.Wrap(err, "requeue failed merge task")
 				}
@@ -386,11 +411,12 @@ func (l *DispatchLogic) dispatchPendingTasks() error {
 		return errors.Wrap(err, "query pending record tasks")
 	}
 	for _, task := range tasks {
-		jobName := jobName("record", task.ID)
+		nextAttempt := task.Attempts + 1
+		jobName := jobName("record", task.ID, nextAttempt)
 		claimed, err := l.svcCtx.DB.RecordTask.Update().
 			Where(recordtask.ID(task.ID), recordtask.StatusEQ(recordtask.StatusPENDING)).
 			SetStatus(recordtask.StatusDISPATCHING).
-			AddAttempts(1).
+			SetAttempts(nextAttempt).
 			SetK8sJobName(jobName).
 			Save(l.ctx)
 		if err != nil {
@@ -435,11 +461,12 @@ func (l *DispatchLogic) dispatchPendingMergeTasks() error {
 		return errors.Wrap(err, "query pending merge tasks")
 	}
 	for _, task := range tasks {
-		jobName := jobName("record-merge", task.ID)
+		nextAttempt := task.Attempts + 1
+		jobName := jobName("record-merge", task.ID, nextAttempt)
 		claimed, err := l.svcCtx.DB.RecordTask.Update().
 			Where(recordtask.ID(task.ID), recordtask.StatusEQ(recordtask.StatusPENDING)).
 			SetStatus(recordtask.StatusDISPATCHING).
-			AddAttempts(1).
+			SetAttempts(nextAttempt).
 			SetK8sJobName(jobName).
 			Save(l.ctx)
 		if err != nil {
@@ -521,9 +548,12 @@ func (l *DispatchLogic) dispatchRecentManifestJobs() error {
 }
 
 type partState struct {
-	maxPart        int
-	active         bool
-	availableParts int
+	maxPart                 int
+	active                  bool
+	availableParts          int
+	lastStatus              recordtask.Status
+	lastUpdatedAt           time.Time
+	latestArtifactUpdatedAt time.Time
 }
 
 func collectPartState(rounds []*ent.MatchRound) map[string]partState {
@@ -537,6 +567,8 @@ func collectPartState(rounds []*ent.MatchRound) map[string]partState {
 			state := out[base]
 			if part > state.maxPart {
 				state.maxPart = part
+				state.lastStatus = task.Status
+				state.lastUpdatedAt = task.UpdatedAt
 			}
 			if isActiveRecordStatus(task.Status) {
 				state.active = true
@@ -544,6 +576,9 @@ func collectPartState(rounds []*ent.MatchRound) map[string]partState {
 			for _, artifact := range task.Edges.MediaArtifacts {
 				if artifact.Kind == "source" && artifact.Status == "AVAILABLE" {
 					state.availableParts++
+					if artifact.UpdatedAt.After(state.latestArtifactUpdatedAt) {
+						state.latestArtifactUpdatedAt = artifact.UpdatedAt
+					}
 					break
 				}
 			}
@@ -551,6 +586,13 @@ func collectPartState(rounds []*ent.MatchRound) map[string]partState {
 		}
 	}
 	return out
+}
+
+func finalNeedsRefresh(final *ent.RecordTask, state partState) bool {
+	if final.Status != recordtask.StatusSUCCEEDED || final.CompletedAt == nil || state.latestArtifactUpdatedAt.IsZero() {
+		return false
+	}
+	return state.latestArtifactUpdatedAt.After(*final.CompletedAt)
 }
 
 func collectFinalTasks(rounds []*ent.MatchRound) map[string]*ent.RecordTask {
@@ -573,6 +615,13 @@ func firstStartedRound(rounds []*ent.MatchRound) *ent.MatchRound {
 		}
 	}
 	return nil
+}
+
+func lastRound(rounds []*ent.MatchRound) *ent.MatchRound {
+	if len(rounds) == 0 {
+		return nil
+	}
+	return rounds[len(rounds)-1]
 }
 
 func isActiveRecordStatus(status recordtask.Status) bool {
@@ -617,8 +666,12 @@ func addPartSuffix(output string, part int) string {
 	return fmt.Sprintf("%s.part%d%s", base, part, ext)
 }
 
-func jobName(prefix string, id int) string {
-	return strings.ToLower(fmt.Sprintf("%s-%d", prefix, id))
+func jobName(prefix string, id, attempt int) string {
+	name := fmt.Sprintf("%s-%d", prefix, id)
+	if attempt > 1 {
+		name = fmt.Sprintf("%s-a%d", name, attempt)
+	}
+	return strings.ToLower(name)
 }
 
 func manifestJobName(matchID string, updatedAt time.Time) string {

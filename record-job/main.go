@@ -152,8 +152,9 @@ func run(ctx context.Context, client *ent.Client, c config.Config, taskID int) e
 }
 
 type recordPart struct {
-	part int
-	path string
+	part       int
+	path       string
+	artifactID int
 }
 
 func runMerge(ctx context.Context, client *ent.Client, c config.Config, taskID int) error {
@@ -184,6 +185,7 @@ func runMerge(ctx context.Context, client *ent.Client, c config.Config, taskID i
 		markRecordFailed(ctx, client, c.PostgresConf.DSN, taskID, err.Error())
 		return err
 	}
+	cleanupMergedParts(ctx, client, conf.BaseDir, taskID, task.Role, fullPath, parts)
 	logx.Infof("record merge completed task_id=%d role=%s parts=%d output=%s", taskID, task.Role, len(parts), path.Clean(task.OutputPath))
 	return nil
 }
@@ -202,7 +204,7 @@ func mergeParts(task *ent.RecordTask) []recordPart {
 			}
 			for _, artifact := range t.Edges.MediaArtifacts {
 				if artifact.Kind == mediaartifact.KindSource && artifact.Status == mediaartifact.StatusAVAILABLE {
-					parts = append(parts, recordPart{part: part, path: artifact.Path})
+					parts = append(parts, recordPart{part: part, path: artifact.Path, artifactID: artifact.ID})
 					break
 				}
 			}
@@ -235,7 +237,7 @@ func mergeFiles(baseDir string, parts []recordPart, output string) error {
 		return errors.Wrap(err, "write concat list")
 	}
 	defer os.Remove(listPath)
-	cmd := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "info", "-f", "concat", "-safe", "0", "-i", listPath, "-c", "copy", "-y", tmp)
+	cmd := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "info", "-f", "concat", "-safe", "0", "-i", listPath, "-c", "copy", "-f", "flv", "-y", tmp)
 	var stderr bytes.Buffer
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = io.MultiWriter(os.Stderr, &stderr)
@@ -248,6 +250,30 @@ func mergeFiles(baseDir string, parts []recordPart, output string) error {
 		return errors.Wrap(err, "rename merged output")
 	}
 	return nil
+}
+
+func cleanupMergedParts(ctx context.Context, client *ent.Client, baseDir string, mergeTaskID int, role string, output string, parts []recordPart) {
+	for _, part := range parts {
+		full := storagepath.Resolve(baseDir, part.path)
+		if filepath.Clean(full) == filepath.Clean(output) {
+			logx.Warnf("record part cleanup skipped output file task_id=%d role=%s part=%d path=%s", mergeTaskID, role, part.part, path.Clean(part.path))
+			continue
+		}
+		if err := os.Remove(full); err != nil && !os.IsNotExist(err) {
+			logx.Errorf("record part cleanup failed task_id=%d role=%s part=%d path=%s error=%v", mergeTaskID, role, part.part, path.Clean(part.path), err)
+			continue
+		}
+		if part.artifactID != 0 {
+			if err := client.MediaArtifact.UpdateOneID(part.artifactID).
+				SetStatus(mediaartifact.StatusDELETED).
+				SetDeletedAt(time.Now()).
+				Exec(ctx); err != nil {
+				logx.Errorf("record part artifact cleanup failed task_id=%d role=%s part=%d artifact_id=%d error=%v", mergeTaskID, role, part.part, part.artifactID, err)
+				continue
+			}
+		}
+		logx.Infof("record part cleaned task_id=%d role=%s part=%d path=%s", mergeTaskID, role, part.part, path.Clean(part.path))
+	}
 }
 
 func copyFile(source, target string) error {
@@ -333,6 +359,12 @@ func completeRecordOutput(ctx context.Context, client *ent.Client, dsn string, t
 	stat, statErr := os.Stat(fullPath)
 	if statErr != nil {
 		return errors.Wrap(statErr, "stat output")
+	}
+	if stat.Size() == 0 {
+		return errors.New("output is empty")
+	}
+	if err := probeMedia(fullPath); err != nil {
+		return err
 	}
 	sum, err := checksum(fullPath)
 	if err != nil {

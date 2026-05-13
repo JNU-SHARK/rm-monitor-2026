@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import argparse
+import fcntl
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -14,6 +16,7 @@ import local_log
 
 DEFAULT_SOURCE_ROOT = "/mnt/PC801/rm-monitor/records"
 DEFAULT_TARGET_ROOT = "/mnt/server_data/rm-monitor/records"
+DEFAULT_LOCK_DIR = Path(__file__).resolve().parents[2] / "logs"
 
 
 @dataclass
@@ -37,8 +40,12 @@ def main() -> int:
     parser.add_argument("--source-root", default=DEFAULT_SOURCE_ROOT)
     parser.add_argument("--target-root", default=DEFAULT_TARGET_ROOT)
     parser.add_argument("--delete-source", action="store_true", help="Delete source files and mark artifacts deleted after verified copy.")
+    parser.add_argument("--delete-source-only", action="store_true", help="Only delete sources whose targets are already verified.")
+    parser.add_argument("--lock-file", default="", help="Per-match lock file. Defaults to logs/archive-match-<match>.lock.")
     parser.add_argument("--submit", action="store_true", help="Actually copy/delete. Without this, print the plan only.")
     args = parser.parse_args()
+    if args.delete_source_only:
+        args.delete_source = True
 
     artifacts = load_artifacts(args)
     if not artifacts:
@@ -61,17 +68,46 @@ def main() -> int:
     for artifact in artifacts:
         source = resolve(Path(args.source_root), artifact.rel_path)
         target = resolve(Path(args.target_root), artifact.rel_path)
-        status = "ready" if target_ok(target, artifact) else "copy"
+        if args.delete_source_only:
+            status = "delete-ready" if target_ok(target, artifact) else "target-missing"
+        else:
+            status = "ready" if target_ok(target, artifact) else "copy"
         print(f"{status}\t{artifact.role}\t{source}\t=>\t{target}")
 
     if not args.submit:
         return 0
 
+    lock = acquire_match_lock(args)
+    try:
+        return archive_or_delete(args, artifacts)
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+
+
+def archive_or_delete(args: argparse.Namespace, artifacts: list[Artifact]) -> int:
     copied = 0
     deleted = 0
     for artifact in artifacts:
         source = resolve(Path(args.source_root), artifact.rel_path)
         target = resolve(Path(args.target_root), artifact.rel_path)
+        if args.delete_source_only:
+            if not target_ok(target, artifact):
+                raise SystemExit(f"verified archive target not found for source deletion: {target}")
+            if source.exists():
+                delete_source_file(source)
+            psql_exec(args, f"update media_artifacts set status='DELETED', deleted_at=now(), updated_at=now() where id={artifact.artifact_id};")
+            deleted += 1
+            local_log.log_event(
+                "archive-artifacts",
+                "INFO",
+                "source deleted after upload and archive",
+                artifact_id=artifact.artifact_id,
+                role=artifact.role,
+                source=str(source),
+                target=str(target),
+            )
+            continue
         local_log.log_event(
             "archive-artifacts",
             "INFO",
@@ -94,7 +130,7 @@ def main() -> int:
         )
         if args.delete_source:
             if source.exists():
-                source.unlink()
+                delete_source_file(source)
             psql_exec(args, f"update media_artifacts set status='DELETED', deleted_at=now(), updated_at=now() where id={artifact.artifact_id};")
             deleted += 1
             local_log.log_event(
@@ -108,6 +144,40 @@ def main() -> int:
     print(f"verified={copied} deleted={deleted}")
     local_log.log_event("archive-artifacts", "INFO", "archive completed", copied=copied, deleted=deleted)
     return 0
+
+
+def acquire_match_lock(args: argparse.Namespace):
+    path = Path(args.lock_file) if args.lock_file else DEFAULT_LOCK_DIR / f"archive-match-{lock_key(args)}.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock = path.open("w")
+    local_log.log_event(
+        "archive-artifacts",
+        "INFO",
+        "waiting for archive match lock",
+        match_id=args.match_id,
+        zone=args.zone,
+        order=args.order,
+        lock_file=str(path),
+    )
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    lock.write(str(os.getpid()))
+    lock.truncate()
+    lock.flush()
+    local_log.log_event(
+        "archive-artifacts",
+        "INFO",
+        "archive match lock acquired",
+        match_id=args.match_id,
+        zone=args.zone,
+        order=args.order,
+        lock_file=str(path),
+    )
+    return lock
+
+
+def lock_key(args: argparse.Namespace) -> str:
+    raw = args.match_id or f"{args.zone}-{args.order}"
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", raw.strip()) or "unknown"
 
 
 def load_artifacts(args: argparse.Namespace) -> list[Artifact]:
@@ -162,6 +232,18 @@ def target_ok(target: Path, artifact: Artifact) -> bool:
     if artifact.checksum and sha256_file(target) != artifact.checksum:
         return False
     return True
+
+
+def delete_source_file(source: Path) -> None:
+    try:
+        source.unlink()
+        return
+    except PermissionError:
+        pass
+    result = subprocess.run(["sudo", "-n", "rm", "--", str(source)], text=True, capture_output=True)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "sudo rm failed"
+        raise PermissionError(f"delete source file failed: {source}: {detail}")
 
 
 def sha256_file(path: Path) -> str:

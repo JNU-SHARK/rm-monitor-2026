@@ -87,6 +87,7 @@ http://192.168.16.3:18080
 logs/biliup-upload.log
 logs/archive-artifacts.log
 logs/emergency-record.log
+logs/continuous-cache.log
 ```
 
 每行是 JSON，便于 dashboard 解析。`download.log` 和 `ds_update.log` 也会作为只读日志源出现在 dashboard 中。
@@ -116,10 +117,10 @@ rm-monitor-records
 默认顺序是：
 
 1. 录制写入 `/mnt/PC801/rm-monitor/records`。
-2. 飞书多维表格先记录相对路径，不上传视频文件，也不立即复制长期目录。
-3. `biliup` 从 `/mnt/PC801/rm-monitor/records` 上传原始 FLV。
-4. Bilibili 上传成功并写回飞书链接后，再复制到 `/mnt/server_data/rm-monitor/records`。
-5. 长期目录复制和校验成功后，删除 `/mnt/PC801` 中对应源文件。
+2. 飞书多维表格先记录相对路径，不上传视频文件。
+3. 最终 `视角.flv` 生成并稳定后，独立长期归档队列立即复制到 `/mnt/server_data/rm-monitor/records` 并校验，不等待 Bilibili 上传排队。
+4. `biliup` 从 `/mnt/PC801/rm-monitor/records` 上传原始 FLV。
+5. 只有 Bilibili 上传成功、飞书链接回填完成、长期目录复制校验成功后，才删除 `/mnt/PC801` 中对应源文件。
 
 ## 外部服务
 
@@ -147,7 +148,7 @@ cookies.json
 deploy/local/biliup_upload_match.py
 ```
 
-该脚本默认从 `/mnt/PC801/rm-monitor/records` 读取源 FLV。使用 `--submit` 成功上传后，会自动调用 [deploy/local/archive_match_artifacts.py](deploy/local/archive_match_artifacts.py) 复制到长期目录、校验、并删除源文件。需要只上传不归档时加 `--no-archive-after-upload`。
+该脚本默认从 `/mnt/PC801/rm-monitor/records` 读取源 FLV。Bilibili 投稿默认使用转载模式：`--copyright 2 --source "RoboMaster 官方直播"`。自动队列会同时运行 [deploy/local/archive_auto_queue.py](deploy/local/archive_auto_queue.py) 提前归档；上传成功后脚本会再次校验长期目录，确认 Bilibili 和归档都成功后才删除本地源文件。同一场比赛的归档、校验、删除会通过本地锁串行化，避免重复拷贝和源文件清理互相抢同一批文件。需要只上传不做归档校验/清理时加 `--no-archive-after-upload`。
 
 当前合集目标：
 
@@ -343,8 +344,52 @@ systemctl is-active rm-monitor-container-net-bypass.service
 4. 单路直播如果 15 秒没有读到数据，当前分段会收尾；只要输出文件含音/视频流，就保留为有效分段，并自动创建 `part2`、`part3` 继续录。
 5. 比赛状态离开 `STARTED` 后，录制任务收到停止信号并收尾；随后每个视角的全部分段会用 `ffmpeg -c copy` 合并成最终 `视角.flv`。
 6. `uploader-dispatcher` 只处理最终 `视角.flv`，不会把内部 `partN` 分段写入飞书或上传链路；飞书多维表格只写相对路径。
-7. 赛后执行 `deploy/local/biliup_upload_match.py --zone 南部赛区 --order N --submit`，从 `/mnt/PC801/rm-monitor/records` 上传最终原始 FLV。
-8. Bilibili 上传成功后，脚本按分 P 写回飞书多维表格视频链接，并在飞书比赛话题里只回复一次总 B 站链接；随后复制到 `/mnt/server_data/rm-monitor/records` 并校验，成功后删除源文件。
+7. `deploy/local/archive_auto_queue.py` 看到赛后最终文件稳定后，会先复制到 `/mnt/server_data/rm-monitor/records` 并校验；这条线不等待 Bilibili 上传队列。
+8. `deploy/local/biliup_auto_queue.py` 赛后按队列调用 `deploy/local/biliup_upload_match.py --submit`，从 `/mnt/PC801/rm-monitor/records` 上传最终原始 FLV。
+9. B 站上传成功后写回飞书多维表格视频链接，并在飞书比赛话题里只回复一次总 B 站链接。
+10. 只有 Bilibili 上传流程和 `/mnt/server_data/rm-monitor/records` 长期归档复制校验都成功后，脚本才删除 `/mnt/PC801` 上对应的本地源文件并把数据库产物标为 `DELETED`。任一侧失败都会保留本地源文件并发告警。
+
+赛区级 A/B 连续缓存是可选降级方案，默认关闭，只在重要比赛或官方误切/网络风险较高时临时启用。缓存不区分场次和 round，只按赛区、日期、视角、lane 写 60 秒 FLV 分片：
+
+```text
+/mnt/PC801/rm-monitor/records/_continuous_cache/RMUC 2026超级对抗赛/南部赛区/YYYY-MM-DD/a/视角/YYYYMMDD_HHMMSS.flv
+/mnt/PC801/rm-monitor/records/_continuous_cache/RMUC 2026超级对抗赛/南部赛区/YYYY-MM-DD/b/视角/YYYYMMDD_HHMMSS.flv
+```
+
+启动或重建 A/B 缓存：
+
+```sh
+deploy/local/start_continuous_cache_jobs.py --zone 南部赛区 --res high --lanes a,b --segment-time 60 --stagger-seconds 30 --apply --replace
+```
+
+关闭 A/B 缓存：
+
+```sh
+kubectl delete job -n rm-monitor -l app.kubernetes.io/name=continuous-cache-ab
+```
+
+A/B 两路独立拉同一视角源，B lane 延迟 30 秒启动。赛后按确认后的比赛时间窗出片：优先使用 `a` lane；若某个 A 分片缺失、过小或 `ffprobe` 失败，则用同时间段的 `b` lane 分片替代。若官方源头本身全局 404，A/B 可能同时缺失；此方案主要抵抗本机网络抖动、单个 ffmpeg 退出和单个分片损坏。旧的按场次 `record-job` 链路暂时保留作兜底，但上传前必须确认最终文件来自正确时间窗。
+
+为某个视角生成 A/B 回退清单：
+
+```sh
+deploy/local/cache_fallback_manifest.py \
+  --date 2026-05-13 \
+  --zone 南部赛区 \
+  --role 主视角 \
+  --start '2026-05-13 09:08:00' \
+  --end '2026-05-13 09:20:00' \
+  --probe \
+  --write-concat /tmp/南部第N场-主视角.concat.txt
+```
+
+清单无 `gaps` 时，可用 `ffmpeg -f concat -safe 0 -i /tmp/南部第N场-主视角.concat.txt -c copy 输出.flv` 生成该视角成品。正式上传前，应对 14 个视角分别生成清单并确认没有 gap。
+
+连续缓存不会随普通上传归档自动清理。需要清理时显式启用：
+
+```sh
+deploy/local/cleanup_continuous_cache.py --match-id 30902 --submit --enabled
+```
 
 自动生成的飞书多维表格按赛区建表，例如 `RMUC 2026超级对抗赛-南部赛区`。新表字段顺序为：`场次`、`阶段`、`红方`、`蓝方`、`视角`、`文件路径`、`视频链接`；当前关闭飞书视频附件上传，因此不会创建 `录像` 附件列。
 
@@ -369,13 +414,15 @@ deploy/local/emergency_record_live.py --zone 南部赛区 --res high --name 南�
 
 2. Pod 内直播源异常但宿主机可访问：继续使用上面的应急录制脚本，它直接在宿主机写 `/mnt/PC801/rm-monitor/emergency`，不依赖 K8s 录制 Job。
 3. 单个视角失败：不要停止其它视角。先让正常视角录完；失败视角尝试单独用应急脚本补录，必要时降到 `--res middle`。
-4. Bilibili 上传失败：不要归档、不要删源。修复登录态或网络后重复执行同一条 `biliup_upload_match.py --submit`。
+4. Bilibili 上传失败：不要删源；长期归档复制可能已经并行完成，但本地源文件仍会保留。修复登录态或网络后重复执行同一条 `biliup_upload_match.py --submit`。
 5. 飞书写链接失败：Bilibili 上传优先。可先加 `--no-feishu-link` 完成上传，之后用 `--add-existing-bvid BV... --zone 南部赛区 --order N --submit` 补写链接。
 6. 长期目录复制失败：源文件仍在 `/mnt/PC801`。修好 `/mnt/server_data` 后执行：
 
 ```sh
-deploy/local/archive_match_artifacts.py --zone 南部赛区 --order N --submit --delete-source
+deploy/local/archive_match_artifacts.py --zone 南部赛区 --order N --submit
 ```
+
+确认 Bilibili 上传也成功后，再执行 `deploy/local/archive_match_artifacts.py --zone 南部赛区 --order N --submit --delete-source-only` 清理本地源文件。
 
 7. `/mnt/PC801` 空间不足：停止非必要写入，优先保留当前比赛源 FLV；不要在复制到长期目录并校验前手动删除源文件。
 
