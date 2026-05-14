@@ -842,7 +842,17 @@ def artifact_pipeline_step(matches: list[dict]) -> dict:
 
 
 def archive_pipeline_step(matches_by_id: dict[str, dict]) -> dict:
+    queue_status = latest_queue_status(Path(CONFIG.local_log_dir) / "archive-auto-queue.log", matches_by_id)
     status = archive_artifact_status(matches_by_id)
+    if (
+        queue_status
+        and queue_status.get("state") == "done"
+        and status
+        and status.get("state") == "running"
+        and status.get("detail") == "archive plan ready"
+        and match_id_of_status(queue_status) == match_id_of_status(status)
+    ):
+        return pipeline_step("长期归档", "done", queue_status.get("match"), queue_status.get("metric", ""), queue_status.get("detail", ""))
     if status:
         return pipeline_step(
             "长期归档",
@@ -851,9 +861,8 @@ def archive_pipeline_step(matches_by_id: dict[str, dict]) -> dict:
             status.get("metric", ""),
             status.get("detail", ""),
         )
-    status = latest_queue_status(Path(CONFIG.local_log_dir) / "archive-auto-queue.log", matches_by_id)
-    if status:
-        return pipeline_step("长期归档", status["state"], status.get("match"), status.get("metric", ""), status.get("detail", ""))
+    if queue_status:
+        return pipeline_step("长期归档", queue_status["state"], queue_status.get("match"), queue_status.get("metric", ""), queue_status.get("detail", ""))
     return pipeline_step("长期归档", "idle", None, "等待", "暂无归档记录")
 
 
@@ -931,6 +940,13 @@ def pipeline_step(label: str, state: str, match: dict | None, metric: str, detai
         "metric": metric,
         "detail": detail,
     }
+
+
+def match_id_of_status(status: dict | None) -> str:
+    if not status:
+        return ""
+    match = status.get("match") or {}
+    return str(match.get("match_id") or status.get("match_id") or "")
 
 
 def latest_match(matches: list[dict], predicate) -> dict | None:
@@ -1547,6 +1563,11 @@ def describe_issue(area: str, title: str, detail: str) -> tuple[str, str]:
         )
 
     if area == "上传任务":
+        if "season not found" in lower:
+            return (
+                "B站合集没有匹配到，通常是合集改名或配置里写的合集 ID 不对；视频还没有开始上传。",
+                "确认当前合集 ID/分区 ID 后更新上传配置，再重启自动上传队列。",
+            )
         if "limit" in lower or "rate" in lower or "too many" in lower:
             return (
                 "B站上传或投稿触发限流，视频可能需要排队或稍后重试。",
@@ -1563,6 +1584,11 @@ def describe_issue(area: str, title: str, detail: str) -> tuple[str, str]:
         )
 
     if area == "本机脚本":
+        if "season not found" in lower:
+            return (
+                "B站合集没有匹配到，上传队列在生成投稿计划时停住了；这通常是合集被改名导致按旧名称找不到。",
+                "改为使用合集 ID/分区 ID 或更新合集名，然后重启自动上传队列。",
+            )
         if "bili" in title.lower() or "upload" in title.lower():
             return (
                 "本机 B站上传脚本报错，上传队列可能卡在某个场次或分P。",

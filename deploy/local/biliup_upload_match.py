@@ -18,13 +18,25 @@ import requests
 import local_log
 
 
+def env_int(name: str, default: str) -> int | None:
+    value = os.environ.get(name, default).strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
 DEFAULT_RECORDS_ROOT = "/mnt/PC801/rm-monitor/records"
 DEFAULT_ARCHIVE_TARGET_ROOT = "/mnt/server_data/rm-monitor/records"
 DEFAULT_CONTINUOUS_CACHE_ROOT = "/mnt/PC801/rm-monitor/records/_continuous_cache"
 DEFAULT_COOKIE = "cookies.json"
 DEFAULT_TITLE_SUFFIX = "RMUC2026区域赛"
 DEFAULT_TAGS = "RoboMaster,RMUC2026,机器人竞赛"
-DEFAULT_SEASON_NAME = "RMUC2026南部赛区录制"
+DEFAULT_SEASON_NAME = os.environ.get("RM_MONITOR_BILI_SEASON_NAME", "RMUC2026南部赛区全视角录制")
+DEFAULT_SEASON_ID = env_int("RM_MONITOR_BILI_SEASON_ID", "8106458")
+DEFAULT_SECTION_ID = env_int("RM_MONITOR_BILI_SECTION_ID", "9007866")
 DEFAULT_COPYRIGHT = "2"
 DEFAULT_REPOST_SOURCE = "RoboMaster 官方直播"
 DEFAULT_BILI_SUBMIT = "web"
@@ -139,8 +151,8 @@ def main() -> int:
     parser.add_argument("--dynamic", default="")
     parser.add_argument("--no-stage-in-title", action="store_true", help="Keep titles like [南部第1场] without match stage.")
     parser.add_argument("--season-name", default=DEFAULT_SEASON_NAME, help="Bilibili collection title.")
-    parser.add_argument("--season-id", type=int, help="Bilibili collection season id.")
-    parser.add_argument("--section-id", type=int, help="Bilibili collection section id.")
+    parser.add_argument("--season-id", type=int, default=DEFAULT_SEASON_ID, help="Bilibili collection season id.")
+    parser.add_argument("--section-id", type=int, default=DEFAULT_SECTION_ID, help="Bilibili collection section id.")
     parser.add_argument("--no-season", action="store_true", help="Do not add the uploaded archive to a collection.")
     parser.add_argument("--no-feishu-link", action="store_true", help="Do not write Bilibili links back to Feishu Bitable.")
     parser.add_argument("--no-feishu-topic-reply", action="store_true", help="Do not reply the final Bilibili link in Feishu match threads.")

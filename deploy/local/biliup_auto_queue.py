@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,6 +20,9 @@ DEFAULT_LIMIT = "7"
 DEFAULT_BILIUP = "deploy/local/biliup_direct_docker.sh"
 DEFAULT_RECORDS_ROOT = "/mnt/PC801/rm-monitor/records"
 DEFAULT_BILI_SUBMIT = "web"
+DEFAULT_SEASON_NAME = os.environ.get("RM_MONITOR_BILI_SEASON_NAME", "")
+DEFAULT_SEASON_ID = os.environ.get("RM_MONITOR_BILI_SEASON_ID", "")
+DEFAULT_SECTION_ID = os.environ.get("RM_MONITOR_BILI_SECTION_ID", "")
 DEFAULT_LOCK_FILE = Path(__file__).resolve().parents[2] / "logs" / "biliup-auto-queue.lock"
 RATE_LIMIT_RETRY_SECONDS = 45 * 60
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -47,6 +51,9 @@ def main() -> int:
         help="biliup final submit API.",
     )
     parser.add_argument("--records-root", default=DEFAULT_RECORDS_ROOT)
+    parser.add_argument("--season-name", default=DEFAULT_SEASON_NAME)
+    parser.add_argument("--season-id", default=DEFAULT_SEASON_ID)
+    parser.add_argument("--section-id", default=DEFAULT_SECTION_ID)
     parser.add_argument("--namespace", default="rm-monitor")
     parser.add_argument("--postgres", default="deployment/postgres")
     parser.add_argument("--db-user", default="rm_monitor")
@@ -99,7 +106,33 @@ def main() -> int:
                 time.sleep(min(args.poll_seconds, max(1, int(retry_at - time.time()))))
                 continue
 
-            code = handle_candidate(args, candidate)
+            try:
+                code = handle_candidate(args, candidate)
+            except SystemExit as exc:
+                code, detail = local_log.normalize_exit(exc.code)
+                if code == 0 and detail:
+                    code = 1
+                local_log.log_event(
+                    SERVICE,
+                    "ERROR" if code else "INFO",
+                    "candidate workflow failed" if code else "candidate workflow finished",
+                    match_id=candidate.match_id,
+                    order=candidate.order,
+                    exit_code=code,
+                    detail=detail,
+                )
+            except Exception as exc:
+                code = 1
+                local_log.log_event(
+                    SERVICE,
+                    "ERROR",
+                    "candidate workflow crashed",
+                    match_id=candidate.match_id,
+                    order=candidate.order,
+                    exit_code=code,
+                    error=str(exc),
+                    traceback=traceback.format_exc(limit=6),
+                )
             if code != 0:
                 failures[candidate.match_id] = time.time() + (RATE_LIMIT_RETRY_SECONDS if code == 75 else 10 * 60)
             if args.once:
@@ -275,7 +308,7 @@ def upload_plan(args: argparse.Namespace, candidate: Candidate) -> dict:
 
 
 def base_command(args: argparse.Namespace, candidate: Candidate) -> list[str]:
-    return [
+    command = [
         sys.executable,
         str(Path(__file__).with_name("biliup_upload_match.py")),
         "--match-id",
@@ -293,6 +326,13 @@ def base_command(args: argparse.Namespace, candidate: Candidate) -> list[str]:
         "--cookie",
         args.cookie,
     ]
+    if args.season_name:
+        command.extend(["--season-name", args.season_name])
+    if args.season_id:
+        command.extend(["--season-id", str(args.season_id)])
+    if args.section_id:
+        command.extend(["--section-id", str(args.section_id)])
+    return command
 
 
 def find_existing_bvid(args: argparse.Namespace, title: str) -> str:
