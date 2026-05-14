@@ -41,6 +41,7 @@ def main() -> int:
     parser.add_argument("--target-root", default=DEFAULT_TARGET_ROOT)
     parser.add_argument("--delete-source", action="store_true", help="Delete source files and mark artifacts deleted after verified copy.")
     parser.add_argument("--delete-source-only", action="store_true", help="Only delete sources whose targets are already verified.")
+    parser.add_argument("--verify-checksum", action="store_true", help="Verify target SHA256 checksums. Defaults to size-only verification for match-day speed.")
     parser.add_argument("--lock-file", default="", help="Per-match lock file. Defaults to logs/archive-match-<match>.lock.")
     parser.add_argument("--submit", action="store_true", help="Actually copy/delete. Without this, print the plan only.")
     args = parser.parse_args()
@@ -64,14 +65,15 @@ def main() -> int:
         source_root=args.source_root,
         target_root=args.target_root,
         delete_source=args.delete_source,
+        verify_checksum=args.verify_checksum,
     )
     for artifact in artifacts:
         source = resolve(Path(args.source_root), artifact.rel_path)
         target = resolve(Path(args.target_root), artifact.rel_path)
         if args.delete_source_only:
-            status = "delete-ready" if target_ok(target, artifact) else "target-missing"
+            status = "delete-ready" if target_ok(target, artifact, args.verify_checksum) else "target-missing"
         else:
-            status = "ready" if target_ok(target, artifact) else "copy"
+            status = "ready" if target_ok(target, artifact, args.verify_checksum) else "copy"
         print(f"{status}\t{artifact.role}\t{source}\t=>\t{target}")
 
     if not args.submit:
@@ -92,7 +94,7 @@ def archive_or_delete(args: argparse.Namespace, artifacts: list[Artifact]) -> in
         source = resolve(Path(args.source_root), artifact.rel_path)
         target = resolve(Path(args.target_root), artifact.rel_path)
         if args.delete_source_only:
-            if not target_ok(target, artifact):
+            if not target_ok(target, artifact, args.verify_checksum):
                 raise SystemExit(f"verified archive target not found for source deletion: {target}")
             if source.exists():
                 delete_source_file(source)
@@ -117,7 +119,7 @@ def archive_or_delete(args: argparse.Namespace, artifacts: list[Artifact]) -> in
             source=str(source),
             target=str(target),
         )
-        copy_verified(source, target, artifact)
+        copy_verified(source, target, artifact, args.verify_checksum)
         copied += 1
         local_log.log_event(
             "archive-artifacts",
@@ -127,6 +129,7 @@ def archive_or_delete(args: argparse.Namespace, artifacts: list[Artifact]) -> in
             role=artifact.role,
             target=str(target),
             size=artifact.size,
+            checksum_verified=args.verify_checksum,
         )
         if args.delete_source:
             if source.exists():
@@ -204,8 +207,8 @@ def load_artifacts(args: argparse.Namespace) -> list[Artifact]:
     return [Artifact(int(row[0]), row[1], row[2], int(row[3] or 0), row[4]) for row in rows]
 
 
-def copy_verified(source: Path, target: Path, artifact: Artifact) -> None:
-    if target_ok(target, artifact):
+def copy_verified(source: Path, target: Path, artifact: Artifact, verify_checksum: bool) -> None:
+    if target_ok(target, artifact, verify_checksum):
         return
     if not source.is_file():
         raise SystemExit(f"missing source file: {source}")
@@ -220,16 +223,16 @@ def copy_verified(source: Path, target: Path, artifact: Artifact) -> None:
     finally:
         if tmp.exists():
             tmp.unlink()
-    if not target_ok(target, artifact):
+    if not target_ok(target, artifact, verify_checksum):
         raise SystemExit(f"verification failed after copy: {target}")
 
 
-def target_ok(target: Path, artifact: Artifact) -> bool:
+def target_ok(target: Path, artifact: Artifact, verify_checksum: bool) -> bool:
     if not target.is_file():
         return False
     if artifact.size and target.stat().st_size != artifact.size:
         return False
-    if artifact.checksum and sha256_file(target) != artifact.checksum:
+    if verify_checksum and artifact.checksum and sha256_file(target) != artifact.checksum:
         return False
     return True
 

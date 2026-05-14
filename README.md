@@ -118,7 +118,7 @@ rm-monitor-records
 
 1. 录制写入 `/mnt/PC801/rm-monitor/records`。
 2. 飞书多维表格先记录相对路径，不上传视频文件。
-3. 最终 `视角.flv` 生成并稳定后，独立长期归档队列立即复制到 `/mnt/server_data/rm-monitor/records` 并校验，不等待 Bilibili 上传排队。
+3. 最终 `视角.flv` 生成并稳定后，独立长期归档队列立即复制到 `/mnt/server_data/rm-monitor/records` 并校验，不等待 Bilibili 上传排队。默认校验文件存在和大小一致；需要完整 SHA256 校验时手动加 `--verify-checksum`。
 4. `biliup` 从 `/mnt/PC801/rm-monitor/records` 上传原始 FLV。
 5. 只有 Bilibili 上传成功、飞书链接回填完成、长期目录复制校验成功后，才删除 `/mnt/PC801` 中对应源文件。
 
@@ -148,7 +148,7 @@ cookies.json
 deploy/local/biliup_upload_match.py
 ```
 
-该脚本默认从 `/mnt/PC801/rm-monitor/records` 读取源 FLV。Bilibili 投稿默认使用转载模式：`--copyright 2 --source "RoboMaster 官方直播"`。自动队列会同时运行 [deploy/local/archive_auto_queue.py](deploy/local/archive_auto_queue.py) 提前归档；上传成功后脚本会再次校验长期目录，确认 Bilibili 和归档都成功后才删除本地源文件。同一场比赛的归档、校验、删除会通过本地锁串行化，避免重复拷贝和源文件清理互相抢同一批文件。需要只上传不做归档校验/清理时加 `--no-archive-after-upload`。
+该脚本默认从 `/mnt/PC801/rm-monitor/records` 读取源 FLV。Bilibili 投稿默认使用转载模式：`--copyright 2 --source "RoboMaster 官方直播"`。自动队列会同时运行 [deploy/local/archive_auto_queue.py](deploy/local/archive_auto_queue.py) 提前归档；上传成功后脚本会再次校验长期目录，确认 Bilibili 和归档都成功后才删除本地源文件。同一场比赛的归档、校验、删除会通过本地锁串行化，避免重复拷贝和源文件清理互相抢同一批文件。默认归档校验只检查文件大小，避免在比赛日反复读取几十 GB 的 SMB 目标文件；需要完整哈希校验时加 `--verify-checksum`。需要只上传不做归档校验/清理时加 `--no-archive-after-upload`。
 
 当前合集目标：
 
@@ -348,7 +348,7 @@ systemctl is-active rm-monitor-container-net-bypass.service
 4. 单路直播如果 15 秒没有读到数据，当前分段会收尾；只要输出文件含音/视频流，就保留为有效分段，并自动创建 `part2`、`part3` 继续录。
 5. 比赛状态离开 `STARTED` 后，录制任务收到停止信号并收尾；随后每个视角的全部分段会用 `ffmpeg -c copy` 合并成最终 `视角.flv`。
 6. `uploader-dispatcher` 只处理最终 `视角.flv`，不会把内部 `partN` 分段写入飞书或上传链路；飞书多维表格只写相对路径。
-7. `deploy/local/archive_auto_queue.py` 看到赛后最终文件稳定后，会先复制到 `/mnt/server_data/rm-monitor/records` 并校验；这条线不等待 Bilibili 上传队列。
+7. `deploy/local/archive_auto_queue.py` 看到赛后最终文件稳定后，会先复制到 `/mnt/server_data/rm-monitor/records` 并做大小校验；这条线不等待 Bilibili 上传队列。完整 SHA256 校验可在手动归档命令中加 `--verify-checksum`。
 8. `deploy/local/biliup_auto_queue.py` 赛后按队列调用 `deploy/local/biliup_upload_match.py --submit`，从 `/mnt/PC801/rm-monitor/records` 上传最终原始 FLV。
 9. B 站上传成功后写回飞书多维表格视频链接，并在飞书比赛话题里只回复一次总 B 站链接。
 10. 只有 Bilibili 上传流程和 `/mnt/server_data/rm-monitor/records` 长期归档复制校验都成功后，脚本才删除 `/mnt/PC801` 上对应的本地源文件并把数据库产物标为 `DELETED`。任一侧失败都会保留本地源文件并发告警。
