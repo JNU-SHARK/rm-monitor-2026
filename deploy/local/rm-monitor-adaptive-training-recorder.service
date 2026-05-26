@@ -1,0 +1,17 @@
+[Unit]
+Description=RM Monitor adaptive training recorder
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=maverick
+Group=maverick
+WorkingDirectory=/home/maverick/RM/rm-monitor-2026
+Environment=HOME=/home/maverick
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /home/maverick/RM/rm-monitor-2026/deploy/local/adaptive_training_recorder.py --zone 北部赛区 --date 2026-05-28 --res high --source-root /mnt/PC801/rm-monitor/adaptive-training --target-root /mnt/server_data/rm-monitor/records --segment-time 3600 --settle-seconds 180 --poll-seconds 30 --stop-at 2026-05-29T00:00:00+08:00
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGINT
+TimeoutStopSec=120

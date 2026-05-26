@@ -1,0 +1,10 @@
+[Unit]
+Description=Start RM Monitor adaptive training upload queue for 2026-05-28
+
+[Timer]
+OnCalendar=2026-05-28 00:10:00
+Persistent=true
+Unit=rm-monitor-adaptive-training-upload.service
+
+[Install]
+WantedBy=timers.target

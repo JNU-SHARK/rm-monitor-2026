@@ -1,0 +1,19 @@
+[Unit]
+Description=RM Monitor archive auto queue
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=maverick
+Group=maverick
+WorkingDirectory=/home/maverick/RM/rm-monitor-2026
+Environment=HOME=/home/maverick
+Environment=KUBECONFIG=/home/maverick/.kube/config
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/bin/python3 deploy/local/archive_auto_queue.py --zone 北部赛区 --start-order 1 --poll-seconds 60
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,16 @@
+[Unit]
+Description=RM Monitor adaptive training public upload queue
+Wants=network-online.target docker.service
+After=network-online.target docker.service
+
+[Service]
+Type=simple
+User=maverick
+Group=maverick
+WorkingDirectory=/home/maverick/RM/rm-monitor-2026
+Environment=HOME=/home/maverick
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /home/maverick/RM/rm-monitor-2026/deploy/local/adaptive_training_upload_queue.py --zone 北部赛区 --date 2026-05-28 --target-root /mnt/server_data/rm-monitor/records --state-file /home/maverick/RM/rm-monitor-2026/logs/adaptive-training-upload-state-2026-05-28-north.json --biliup /home/maverick/RM/rm-monitor-2026/deploy/local/biliup_direct_docker.sh --cookie /home/maverick/RM/rm-monitor-2026/cookies.json --is-only-self 0 --season-name RMUC2026北部赛区全视角录制 --season-id 8209772 --section-id 9124491 --poll-seconds 300 --settle-seconds 300 --hour-delay-seconds 600 --retry-seconds 1800 --stop-at 2026-05-29T06:00:00+08:00 --submit
+Restart=on-failure
+RestartSec=60
+TimeoutStopSec=120

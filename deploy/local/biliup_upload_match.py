@@ -34,9 +34,9 @@ DEFAULT_CONTINUOUS_CACHE_ROOT = "/mnt/PC801/rm-monitor/records/_continuous_cache
 DEFAULT_COOKIE = "cookies.json"
 DEFAULT_TITLE_SUFFIX = "RMUC2026区域赛"
 DEFAULT_TAGS = "RoboMaster,RMUC2026,机器人竞赛"
-DEFAULT_SEASON_NAME = os.environ.get("RM_MONITOR_BILI_SEASON_NAME", "RMUC2026南部赛区全视角录制")
-DEFAULT_SEASON_ID = env_int("RM_MONITOR_BILI_SEASON_ID", "8106458")
-DEFAULT_SECTION_ID = env_int("RM_MONITOR_BILI_SECTION_ID", "9007866")
+DEFAULT_SEASON_NAME = os.environ.get("RM_MONITOR_BILI_SEASON_NAME", "RMUC2026北部赛区全视角录制")
+DEFAULT_SEASON_ID = env_int("RM_MONITOR_BILI_SEASON_ID", "8209772")
+DEFAULT_SECTION_ID = env_int("RM_MONITOR_BILI_SECTION_ID", "9124491")
 DEFAULT_COPYRIGHT = "2"
 DEFAULT_REPOST_SOURCE = "RoboMaster 官方直播"
 DEFAULT_BILI_SUBMIT = "web"
@@ -951,16 +951,9 @@ def load_bili_session(cookie_path: Path) -> tuple[requests.Session, str]:
 
 
 def resolve_season(session: requests.Session, args: argparse.Namespace) -> SeasonInfo:
-    if args.season_id and args.section_id:
-        return SeasonInfo(
-            season_id=args.season_id,
-            section_id=args.section_id,
-            title=args.season_name or str(args.season_id),
-            section_title="正片",
-        )
     resp = session.get(
         "https://member.bilibili.com/x2/creative/web/seasons",
-        params={"pn": 1, "ps": 50, "order": "mtime", "sort": "desc", "draft": 1},
+        params={"pn": 1, "ps": 100, "order": "mtime", "sort": "desc", "draft": 1},
         timeout=15,
     )
     resp.raise_for_status()
@@ -974,13 +967,23 @@ def resolve_season(session: requests.Session, args: argparse.Namespace) -> Seaso
             continue
         if not args.season_id and season.get("title") != target_name:
             continue
+        if args.season_id and target_name and season.get("title") != target_name:
+            raise SystemExit(
+                f"season id/title mismatch: id {args.season_id} is {season.get('title')!r}, "
+                f"not {target_name!r}"
+            )
         sections = item.get("sections", {}).get("sections") or []
         if not sections:
             raise SystemExit(f"season {season.get('title')} has no sections")
-        section = sections[0]
+        if args.section_id:
+            section = next((sec for sec in sections if int(sec.get("id", 0)) == args.section_id), None)
+            if section is None:
+                raise SystemExit(f"section {args.section_id} not found in season {season.get('title')}")
+        else:
+            section = sections[0]
         return SeasonInfo(
             season_id=int(season["id"]),
-            section_id=int(args.section_id or section["id"]),
+            section_id=int(section["id"]),
             title=season.get("title", str(season["id"])),
             section_title=section.get("title", "正片"),
         )

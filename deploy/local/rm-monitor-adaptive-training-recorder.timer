@@ -1,0 +1,10 @@
+[Unit]
+Description=Start RM Monitor adaptive training recorder for 2026-05-28
+
+[Timer]
+OnCalendar=2026-05-28 00:00:00
+Persistent=true
+Unit=rm-monitor-adaptive-training-recorder.service
+
+[Install]
+WantedBy=timers.target
