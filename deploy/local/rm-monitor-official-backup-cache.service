@@ -1,0 +1,20 @@
+[Unit]
+Description=RM Monitor official match hourly backup cache
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=maverick
+Group=maverick
+WorkingDirectory=/home/maverick/RM/rm-monitor-2026
+Environment=HOME=/home/maverick
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /home/maverick/RM/rm-monitor-2026/deploy/local/official_backup_cache_recorder.py --zone 东部赛区 --res high --source-root /mnt/PC801/rm-monitor/official-backup-cache --target-root /mnt/server_data/rm-monitor/records --segment-time 3600 --settle-seconds 180 --poll-seconds 30 --schedule-refresh-seconds 300 --no-record-on-schedule-error
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGINT
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

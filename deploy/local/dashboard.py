@@ -19,6 +19,12 @@ DEFAULT_REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_LOCAL_LOG_DIR = DEFAULT_REPO_ROOT / "logs"
 SCHEDULE_URL = "https://pro-robomasters-hz-n5i3.oss-cn-hangzhou.aliyuncs.com/live_json/schedule.json"
 LIVE_INFO_URL = "https://rm-static.djicdn.com/live_json/live_game_info.json"
+OFFICIAL_BACKUP_CACHE_SERVICE = "rm-monitor-official-backup-cache.service"
+OFFICIAL_BACKUP_CACHE_EVENT = "RMUC 2026超级对抗赛"
+OFFICIAL_BACKUP_CACHE_ZONE = "东部赛区"
+OFFICIAL_BACKUP_CACHE_SESSION = "正赛备用缓存"
+OFFICIAL_BACKUP_CACHE_SOURCE_ROOT = Path("/mnt/PC801/rm-monitor/official-backup-cache")
+OFFICIAL_BACKUP_CACHE_TARGET_ROOT = Path("/mnt/server_data/rm-monitor/records")
 LOG_TARGETS = [
     ("全部服务", "all"),
     ("monitor", "deployment/monitor"),
@@ -37,6 +43,7 @@ LOG_TARGETS = [
     ("local-archive", "local-log/archive-artifacts"),
     ("local-emergency-record", "local-log/emergency-record"),
     ("local-continuous-cache", "local-log/continuous-cache"),
+    ("local-backup-cache", "local-log/official-backup-cache"),
     ("biliup-download.log", "local-file/download.log"),
     ("biliup-ds_update.log", "local-file/ds_update.log"),
 ]
@@ -727,9 +734,11 @@ def collect_current_snapshot() -> dict:
 
 
 def collect_pipeline_progress() -> dict:
-    matches = collect_match_progress()
+    scope = current_match_scope()
+    matches = collect_match_progress(scope)
     by_id = {item["match_id"]: item for item in matches}
     return {
+        "scope": scope,
         "steps": [
             record_pipeline_step(matches),
             artifact_pipeline_step(matches),
@@ -737,10 +746,116 @@ def collect_pipeline_progress() -> dict:
             upload_pipeline_step(by_id),
             cleanup_pipeline_step(by_id),
         ],
+        "backup_cache": official_backup_cache_step(),
     }
 
 
-def collect_match_progress() -> list[dict]:
+def current_match_scope() -> dict:
+    today = time.strftime("%Y-%m-%d")
+    zones = active_schedule_zones(today)
+    return {
+        "date": today,
+        "zones": zones,
+        "source": "official-schedule" if zones else "updated-today",
+    }
+
+
+def active_schedule_zones(date_text: str) -> list[str]:
+    try:
+        req = urllib.request.Request(SCHEDULE_URL, headers={"User-Agent": "RMMonitorDashboard/1.0"})
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            data = json.load(resp)
+    except Exception:
+        return []
+    zones: set[str] = set()
+
+    def walk(item):
+        if isinstance(item, dict):
+            name = str(item.get("name") or item.get("zoneName") or "")
+            match_dates = item.get("matchDates")
+            if name and isinstance(match_dates, list) and date_text in match_dates:
+                zones.add(name)
+            for value in item.values():
+                walk(value)
+        elif isinstance(item, list):
+            for value in item:
+                walk(value)
+
+    walk(data)
+    return sorted(zones)
+
+
+def official_backup_cache_step() -> dict:
+    service = local_systemd_service_status(OFFICIAL_BACKUP_CACHE_SERVICE)
+    events = read_json_log_events(Path(CONFIG.local_log_dir) / "official-backup-cache.log", 1000)
+    latest_script_start = latest_event(events, "script started")
+    start_ts = float((latest_script_start or {}).get("_timestamp") or 0)
+    current_events = [item for item in events if not start_ts or float(item.get("_timestamp") or 0) >= start_ts]
+    gate = latest_event(current_events, "schedule gate changed")
+    last_archive = latest_event(current_events, "segment archived")
+    errors = [item for item in current_events if str(item.get("level") or "").upper() == "ERROR"]
+    ffmpeg = official_backup_cache_ffmpeg()
+    target_stats = flv_tree_stats(official_backup_cache_day_dir(OFFICIAL_BACKUP_CACHE_TARGET_ROOT))
+    source_stats = flv_tree_stats(official_backup_cache_day_dir(OFFICIAL_BACKUP_CACHE_SOURCE_ROOT))
+
+    service_active = service.get("active_state") == "active"
+    if not service.get("ok"):
+        state = "bad"
+        metric = "服务未知"
+    elif not service_active:
+        state = "bad"
+        metric = service.get("active_state") or "未运行"
+    elif errors:
+        state = "bad"
+        metric = "脚本报错"
+    elif ffmpeg["count"] > 0:
+        state = "running"
+        metric = f"{ffmpeg['count']} 路录制中"
+    else:
+        state = "idle"
+        reason = str((gate or {}).get("reason") or "")
+        metric = "待第一场" if "before first planned match" in reason else "空转等待"
+
+    detail_parts = [
+        f"长期归档 {target_stats['files']} 个 / {human_bytes(target_stats['bytes'])}",
+        f"本地临时 {source_stats['files']} 个 / {human_bytes(source_stats['bytes'])}",
+    ]
+    roles = ffmpeg.get("roles") or []
+    if roles:
+        detail_parts.append("当前 " + "、".join(roles[:4]) + (" 等" if len(roles) > 4 else ""))
+    if gate and gate.get("reason"):
+        detail_parts.append(backup_cache_reason_text(str(gate["reason"])))
+    elif last_archive:
+        detail_parts.append("上次归档 " + event_clock(last_archive))
+    elif service.get("ok"):
+        detail_parts.append(f"systemd {service.get('active_state')}/{service.get('sub_state')}")
+    else:
+        detail_parts.append(str(service.get("error") or "无法读取 systemd 状态"))
+
+    return {
+        "label": "正赛备用缓存",
+        "state": state,
+        "match_id": "",
+        "match_label": "独立链路，不上传 B 站",
+        "metric": metric,
+        "detail": "；".join(detail_parts),
+        "archive_files": target_stats["files"],
+        "archive_bytes": target_stats["bytes"],
+        "source_files": source_stats["files"],
+        "source_bytes": source_stats["bytes"],
+        "service_active": service_active,
+        "ffmpeg_count": ffmpeg["count"],
+    }
+
+
+def collect_match_progress(scope: dict) -> list[dict]:
+    zones = list(scope.get("zones") or [])
+    if zones:
+        zone_filter = "and m.zone in (" + ", ".join(sql_literal(zone) for zone in zones) + ")"
+        time_filter = ""
+    else:
+        zone_filter = ""
+        time_filter = "and m.updated_at >= date_trunc('day', now())"
     query = """
         select
             m.id,
@@ -760,23 +875,25 @@ def collect_match_progress() -> list[dict]:
             count(distinct rec.id) filter (where rec.status in ('PENDING', 'DISPATCHING', 'RUNNING')),
             count(distinct rec.id) filter (where rec.status = 'FAILED'),
             count(distinct rec.id) filter (where rec.status = 'SUCCEEDED'),
-            count(distinct ma.id) filter (where ma.kind = 'source'),
-            coalesce(sum(ma.file_size) filter (where ma.kind = 'source'), 0)
+            count(distinct ma.id) filter (where ma.kind = 'source' and rec.role not like '%__part%'),
+            coalesce(sum(ma.file_size) filter (where ma.kind = 'source' and rec.role not like '%__part%'), 0),
+            count(distinct ma.id) filter (where ma.kind = 'source' and rec.role like '%__part%')
         from matches m
         join teams rt on rt.id = m.team_red_matches
         join teams bt on bt.id = m.team_blue_matches
         left join match_rounds mr on mr.match_rounds = m.id
         left join record_tasks rec on rec.match_round_record_tasks = mr.id
         left join media_artifacts ma on ma.record_task_media_artifacts = rec.id
-        where m.updated_at >= date_trunc('day', now())
-          and m.event not like '%测试%'
+        where m.event not like '%测试%'
           and m.zone not like '%测试%'
+          {zone_filter}
+          {time_filter}
         group by m.id, rt.id, bt.id
         order by m."order";
-    """
+    """.format(zone_filter=zone_filter, time_filter=time_filter)
     matches = []
     for row in psql(query, "pipeline_matches", []):
-        if len(row) < 19:
+        if len(row) < 20:
             continue
         item = {
             "match_id": row[0],
@@ -798,6 +915,7 @@ def collect_match_progress() -> list[dict]:
             "record_succeeded": to_int(row[16]),
             "source_artifacts": to_int(row[17]),
             "source_bytes": to_int(row[18]),
+            "source_part_artifacts": to_int(row[19]),
         }
         item["label"] = match_progress_label(item)
         matches.append(item)
@@ -868,16 +986,22 @@ def archive_pipeline_step(matches_by_id: dict[str, dict]) -> dict:
 
 def upload_pipeline_step(matches_by_id: dict[str, dict]) -> dict:
     events = read_json_log_events(Path(CONFIG.local_log_dir) / "biliup-upload.log", 1200)
-    starts = [item for item in events if event_message(item) == "biliup upload started"]
+    starts = [
+        item
+        for item in events
+        if event_message(item) == "biliup upload started" and event_match(item, matches_by_id)
+    ]
     completions = [
         item
         for item in events
         if event_message(item) in ("biliup submit completed", "biliup upload workflow completed", "existing BVID workflow completed")
+        and event_match(item, matches_by_id)
     ]
     failures = [
         item
         for item in events
         if event_message(item) in ("biliup upload failed", "biliup submit rate limited")
+        and event_match(item, matches_by_id)
     ]
     latest_start = starts[-1] if starts else None
     latest_completion = completions[-1] if completions else None
@@ -920,15 +1044,134 @@ def upload_pipeline_step(matches_by_id: dict[str, dict]) -> dict:
 
 def cleanup_pipeline_step(matches_by_id: dict[str, dict]) -> dict:
     events = read_json_log_events(Path(CONFIG.local_log_dir) / "biliup-upload.log", 1200)
-    starts = [item for item in events if event_message(item) == "local source deletion started after upload and archive"]
-    completions = [item for item in events if event_message(item) == "local source deletion completed after upload and archive"]
+    starts = [
+        item
+        for item in events
+        if event_message(item) == "local source deletion started after upload and archive"
+        and event_match(item, matches_by_id)
+    ]
+    completions = [
+        item
+        for item in events
+        if event_message(item) == "local source deletion completed after upload and archive"
+        and event_match(item, matches_by_id)
+    ]
     latest_start = starts[-1] if starts else None
     latest_completion = completions[-1] if completions else None
     if latest_start and not event_after_for_match(latest_completion, latest_start):
-        return pipeline_step("本地清理", "running", event_match(latest_start, matches_by_id), "删除中", "上传和归档均完成后删除本地源文件")
+        return pipeline_step("本地清理", "running", event_match(latest_start, matches_by_id), "删除中", "归档可先行；本地源文件删除需等上传完成并确认长期归档")
     if latest_completion:
-        return pipeline_step("本地清理", "done", event_match(latest_completion, matches_by_id), "已清理", "本地源文件已按流程释放")
-    return pipeline_step("本地清理", "idle", None, "等待", "等待上传和长期归档完成")
+        return pipeline_step("本地清理", "done", event_match(latest_completion, matches_by_id), "已清理", "上传完成且长期归档已校验，本地源文件已释放")
+    return pipeline_step("本地清理", "idle", None, "等待", "长期归档不等上传；这里只等待可安全删除本地源文件")
+
+
+def local_systemd_service_status(service_name: str) -> dict:
+    result = run(
+        [
+            "systemctl",
+            "show",
+            service_name,
+            "--no-pager",
+            "--property=ActiveState",
+            "--property=SubState",
+            "--property=UnitFileState",
+            "--property=ExecMainPID",
+        ],
+        timeout=3,
+    )
+    if not result["ok"]:
+        return {"ok": False, "error": result["error"]}
+    fields = {}
+    for line in result["stdout"].splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            fields[key] = value
+    return {
+        "ok": True,
+        "active_state": fields.get("ActiveState", ""),
+        "sub_state": fields.get("SubState", ""),
+        "unit_file_state": fields.get("UnitFileState", ""),
+        "pid": to_int(fields.get("ExecMainPID")),
+    }
+
+
+def official_backup_cache_ffmpeg() -> dict:
+    result = run(["pgrep", "-af", "ffmpeg"], timeout=3)
+    lines = []
+    if result["stdout"]:
+        lines = [
+            line
+            for line in result["stdout"].splitlines()
+            if "ffmpeg" in line and "official-backup-cache" in line and "正赛备用缓存" in line
+        ]
+    roles = []
+    for line in lines:
+        match = re.search(r"正赛备用缓存/([^/]+)/[^/]+\.flv", line)
+        if match:
+            roles.append(match.group(1))
+    return {"count": len(lines), "roles": sorted(set(roles))}
+
+
+def backup_cache_reason_text(reason: str) -> str:
+    match = re.search(r"before first planned match at (.+)$", reason)
+    if match:
+        return f"第一场前等待：{match.group(1)}"
+    match = re.search(r"after daily hard stop for last planned match at (.+)$", reason)
+    if match:
+        return f"已过当天兜底停止时间：{match.group(1)}"
+    if "inside planned match day window" in reason:
+        return "正赛窗口内，等待或录制直播信号"
+    if "all planned matches for date are terminal" in reason:
+        return "当天计划场次已全部结束"
+    if "date is not in zone matchDates" in reason:
+        return "今天不是该赛区比赛日"
+    if "schedule unavailable" in reason:
+        return "赛程暂不可用"
+    return reason
+
+
+def official_backup_cache_day_dir(root: Path) -> Path:
+    return (
+        root
+        / OFFICIAL_BACKUP_CACHE_EVENT
+        / OFFICIAL_BACKUP_CACHE_ZONE
+        / f"{time.strftime('%Y-%m-%d')} {OFFICIAL_BACKUP_CACHE_SESSION}"
+    )
+
+
+def flv_tree_stats(root: Path) -> dict:
+    stats = {"files": 0, "bytes": 0}
+    if not root.exists() or not root.is_dir():
+        return stats
+    try:
+        files = list(root.rglob("*.flv"))
+    except OSError:
+        return stats
+    for path in files:
+        try:
+            if not path.is_file():
+                continue
+            stat = path.stat()
+        except OSError:
+            continue
+        stats["files"] += 1
+        stats["bytes"] += stat.st_size
+    return stats
+
+
+def latest_event(events: list[dict], message: str) -> dict | None:
+    for item in reversed(events):
+        if event_message(item) == message:
+            return item
+    return None
+
+
+def event_clock(item: dict) -> str:
+    value = str(item.get("time") or "")
+    timestamp = parse_timestamp_epoch(value)
+    if timestamp:
+        return time.strftime("%H:%M:%S", time.localtime(timestamp))
+    return value or "--"
 
 
 def pipeline_step(label: str, state: str, match: dict | None, metric: str, detail: str) -> dict:
@@ -959,8 +1202,18 @@ def latest_match(matches: list[dict], predicate) -> dict | None:
 
 def latest_queue_status(path: Path, matches_by_id: dict[str, dict]) -> dict | None:
     events = read_json_log_events(path, 1200)
-    selected = [item for item in events if event_message(item) in ("archive candidate selected", "candidate selected")]
-    finished = [item for item in events if event_message(item) in ("archive candidate finished", "candidate workflow finished")]
+    selected = [
+        item
+        for item in events
+        if event_message(item) in ("archive candidate selected", "candidate selected")
+        and event_match(item, matches_by_id)
+    ]
+    finished = [
+        item
+        for item in events
+        if event_message(item) in ("archive candidate finished", "candidate workflow finished")
+        and event_match(item, matches_by_id)
+    ]
     if selected and not event_after_for_match(finished[-1] if finished else None, selected[-1]):
         return {"state": "running", "match": event_match(selected[-1], matches_by_id), "metric": "进行中", "detail": event_message(selected[-1])}
     if finished:
@@ -976,9 +1229,11 @@ def archive_artifact_status(matches_by_id: dict[str, dict]) -> dict | None:
     last_delete_match_id = ""
     for item in events:
         match = archive_event_match(item, matches_by_id)
-        match_id = str((match or {}).get("match_id") or item.get("match_id") or "")
         msg = event_message(item)
         timestamp = item.get("_timestamp") or 0
+        if msg != "archive completed" and match is None:
+            continue
+        match_id = str((match or {}).get("match_id") or "")
         if msg == "archive plan ready" and match_id:
             states[match_id] = {
                 "match": match,
@@ -1075,6 +1330,10 @@ def archive_event_match(item: dict, matches_by_id: dict[str, dict]) -> dict | No
         if zoned:
             return zoned[-1]
     return candidates[-1] if candidates else None
+
+
+def sql_literal(value: str) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
 
 
 def read_json_log_events(path: Path, tail: int) -> list[dict]:
@@ -1678,7 +1937,7 @@ def is_local_success_event(fields: dict) -> bool:
     if str(fields.get("level") or "").upper() != "INFO":
         return False
     msg = str(fields.get("msg") or fields.get("message") or "").lower()
-    return "completed" in msg or "finished" in msg
+    return "completed" in msg or "finished" in msg or "script started" in msg
 
 
 def has_recent_restart(statuses: list[dict]) -> bool:
@@ -1949,6 +2208,26 @@ INDEX_HTML = r"""<!doctype html>
       grid-template-columns: repeat(5, minmax(0, 1fr));
       gap: 10px;
     }
+    .backup-cache-head {
+      margin: 14px 0 8px;
+      padding-top: 12px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 760;
+    }
+    .pipeline-scope {
+      margin: -2px 0 10px;
+      color: var(--muted);
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+    .backup-cache-grid {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .backup-cache-grid .pipeline-step {
+      min-height: 112px;
+    }
     .pipeline-step {
       min-height: 132px;
       padding: 13px;
@@ -2151,8 +2430,11 @@ INDEX_HTML = r"""<!doctype html>
   <main>
     <section id="headline" class="headline"></section>
     <section class="panel pipeline-panel">
-      <h2>流程进度</h2>
+      <h2>按场次流程</h2>
+      <div id="pipeline-scope" class="pipeline-scope"></div>
       <div id="pipeline-steps" class="pipeline-grid"></div>
+      <div class="backup-cache-head">独立备用缓存</div>
+      <div id="backup-cache-step" class="pipeline-grid backup-cache-grid"></div>
     </section>
     <section class="dashboard-grid">
       <section class="panel">
@@ -2304,6 +2586,8 @@ INDEX_HTML = r"""<!doctype html>
       const current = data.current || {};
       const history = data.history || {};
       const pipeline = data.pipeline || {};
+      const backupCache = pipeline.backup_cache || {};
+      const pipelineScope = pipeline.scope || {};
       const severity = summary.severity || "ok";
       $("health-dot").className = `dot ${severity}`;
       $("generated").textContent = `${data.generated_at || "--"} / ${data.namespace || ""} / ${data.duration_ms || 0} ms`;
@@ -2313,6 +2597,7 @@ INDEX_HTML = r"""<!doctype html>
       const upload = statusFor(issues, ["上传任务", "本机脚本"]);
       const storage = statusFor(issues, ["存储"]);
       const external = statusFor(issues, ["外部源"]);
+      const backupCacheStatus = backupCache.state === "bad" ? "bad" : (backupCache.state === "warn" ? "warn" : "ok");
       const logSignal = summary.bad_issues ? "bad" : ((currentLevels.ERROR || currentLevels.WARN || summary.warn_issues) ? "warn" : "ok");
       const action = severity === "bad" ? "需要立即处理" : (severity === "warn" ? "可以继续，赛前确认" : "可以值守");
       const headlineDetail = severity === "bad"
@@ -2331,15 +2616,22 @@ INDEX_HTML = r"""<!doctype html>
         check("服务运行", k8s, firstIssue(issues, ["Kubernetes", "日志采集", "数据库"], deploymentLine(current))),
         check("官方直播", external, firstIssue(issues, ["外部源"], externalLine(current))),
         check("自动录制", record, firstIssue(issues, ["录制任务", "录制链路"], "未发现录制失败或开赛未录制")),
-        check("Bili 上传", upload, firstIssue(issues, ["上传任务", "本机脚本"], "上传、飞书回填、长期归档未报告异常")),
+        check("备用缓存", backupCacheStatus, backupCache.detail || "正赛备用缓存独立运行"),
+        check("Bili 上传", upload, firstIssue(issues, ["上传任务", "本机脚本"], "上传和飞书回填未报告异常；长期归档看独立卡片")),
         check("存储空间", storage, firstIssue(issues, ["存储"], storageLine(current))),
         check("告警信号", logSignal, (currentLevels.ERROR || currentLevels.WARN) ? `近 15 分钟 ERROR ${currentLevels.ERROR || 0}，WARN ${currentLevels.WARN || 0}` : "近 15 分钟无 ERROR/WARN"),
       ].join("");
 
       const steps = pipeline.steps || [];
+      $("pipeline-scope").textContent = pipelineScope.zones && pipelineScope.zones.length
+        ? `${pipelineScope.date || "--"} / ${pipelineScope.zones.join("、")} / 官方赛程`
+        : `${pipelineScope.date || "--"} / 今日更新数据`;
       $("pipeline-steps").innerHTML = steps.length
         ? steps.map(pipelineStep).join("")
         : `<div class="empty">暂无流程数据</div>`;
+      $("backup-cache-step").innerHTML = backupCache.label
+        ? pipelineStep(backupCache)
+        : `<div class="empty">暂无备用缓存数据</div>`;
 
       $("issues").innerHTML = issues.length
         ? issues.map(item => `<div class="issue-item ${esc(item.severity)}"><div class="issue-title">${esc(item.area)} · ${esc(item.title)}</div><div class="issue-detail">${esc(item.detail)}</div>${item.action ? `<div class="issue-action">建议：${esc(item.action)}</div>` : ""}</div>`).join("")
@@ -2353,6 +2645,7 @@ INDEX_HTML = r"""<!doctype html>
       const scripts = history.local_scripts || {};
       const historyCards = [
         stat("录制任务", records.total || 0, `成功 ${statusCount(records, "SUCCEEDED")}，失败 ${statusCount(records, "FAILED")}，进行中 ${statusCount(records, "RUNNING", "DISPATCHING", "PENDING")}`),
+        stat("备用缓存", backupCache.archive_files || 0, `长期归档 ${formatBytes(backupCache.archive_bytes || 0)}，本地临时 ${backupCache.source_files || 0} 个`),
         stat("上传任务", uploads.total || 0, `成功 ${statusCount(uploads, "SUCCEEDED")}，失败 ${statusCount(uploads, "FAILED")}，等待 ${statusCount(uploads, "PENDING", "DISPATCHING")}`),
         stat("转码任务", transcodes.total || 0, `成功 ${statusCount(transcodes, "SUCCEEDED")}，失败 ${statusCount(transcodes, "FAILED")}`),
         stat("源文件", sourceArtifact.count || 0, `今日新增 ${formatBytes(sourceArtifact.bytes || 0)}`),
