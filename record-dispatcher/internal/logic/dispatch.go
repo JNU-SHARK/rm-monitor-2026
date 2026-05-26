@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"entgo.io/ent/dialect/sql"
 	"github.com/pkg/errors"
 	"scutbot.cn/web/rm-monitor/ent"
 	"scutbot.cn/web/rm-monitor/ent/match"
@@ -35,6 +36,7 @@ const continuationRetryAfter = 60 * time.Second
 const finalizeAfterRecordStable = 5 * time.Minute
 const manifestLookback = 30 * time.Second
 const matchStatusStarted = "STARTED"
+const matchStatusDone = "DONE"
 const partRoleMarker = "__part"
 const mergeSourcePrefix = "merge:"
 
@@ -90,6 +92,9 @@ func (l *DispatchLogic) cancelEndedRounds() error {
 }
 
 func shouldCancelRecordTask(task *ent.RecordTask) bool {
+	if strings.HasPrefix(task.SourceURL, mergeSourcePrefix) {
+		return false
+	}
 	round := task.Edges.MatchRound
 	if round == nil {
 		return false
@@ -294,7 +299,10 @@ func (l *DispatchLogic) createContinuationTasks() error {
 
 func (l *DispatchLogic) createMergeTasksForEndedMatches() error {
 	matches, err := l.svcCtx.DB.Match.Query().
-		Where(match.LatestStatusNEQ(matchStatusStarted)).
+		Where(
+			match.LatestStatusEQ(matchStatusDone),
+			match.HasRoundsWith(matchround.HasRecordTasksWith(recordtask.RoleContains(partRoleMarker))),
+		).
 		WithRedTeam().
 		WithBlueTeam().
 		WithRounds(func(q *ent.MatchRoundQuery) {
@@ -303,7 +311,8 @@ func (l *DispatchLogic) createMergeTasksForEndedMatches() error {
 					q.WithMediaArtifacts()
 				})
 		}).
-		Limit(100).
+		Order(match.ByUpdatedAt(sql.OrderDesc())).
+		Limit(500).
 		All(l.ctx)
 	if err != nil {
 		return errors.Wrap(err, "query ended matches for merge")
