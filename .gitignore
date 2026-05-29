@@ -29,6 +29,7 @@ go.work.sum
 /cookies.json
 /download.log
 /ds_update.log
+/ds_update.log.*
 
 .idea
 build

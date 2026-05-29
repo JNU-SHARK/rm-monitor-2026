@@ -1,0 +1,14 @@
+[Unit]
+Description=RM Monitor cluster DNS guard
+After=network-online.target k3s.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=maverick
+Group=maverick
+WorkingDirectory=/home/maverick/RM/rm-monitor-2026
+Environment=HOME=/home/maverick
+Environment=KUBECONFIG=/home/maverick/.kube/config
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/bin/python3 deploy/local/cluster_dns_guard.py --repair

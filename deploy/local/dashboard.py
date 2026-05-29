@@ -44,6 +44,7 @@ LOG_TARGETS = [
     ("local-emergency-record", "local-log/emergency-record"),
     ("local-continuous-cache", "local-log/continuous-cache"),
     ("local-backup-cache", "local-log/official-backup-cache"),
+    ("local-dns-guard", "local-log/cluster-dns-guard"),
     ("biliup-download.log", "local-file/download.log"),
     ("biliup-ds_update.log", "local-file/ds_update.log"),
 ]

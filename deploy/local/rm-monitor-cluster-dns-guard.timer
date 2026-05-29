@@ -1,0 +1,11 @@
+[Unit]
+Description=Run RM Monitor cluster DNS guard every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=15s
+Unit=rm-monitor-cluster-dns-guard.service
+
+[Install]
+WantedBy=timers.target
