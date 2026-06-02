@@ -10,6 +10,8 @@
 
 这份 README 同时作为部署台账。项目结束时，优先按本文档逐项检查；脚本只能作为辅助，不能替代人工核对。
 
+赛中/赛后运维速查见 [deploy/local/OPERATIONS.md](deploy/local/OPERATIONS.md)，其中记录了完整性审计 SQL、关停顺序、重启方式和 2026 区域赛收尾时发现的已知缺口。
+
 ## 仓库
 
 - 当前仓库：`https://github.com/JNU-SHARK/rm-monitor-2026.git`
