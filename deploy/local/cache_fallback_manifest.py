@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -11,7 +12,8 @@ import local_log
 
 
 DEFAULT_CACHE_ROOT = "/mnt/PC801/rm-monitor/records/_continuous_cache"
-DEFAULT_EVENT = "RMUC 2026超级对抗赛"
+DEFAULT_EVENT = os.environ.get("RM_MONITOR_EVENT_NAME", "RMUC 2026超级对抗赛")
+DEFAULT_ZONE = os.environ.get("RM_MONITOR_ZONE", "全国赛")
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 FILE_TIME_FORMAT = "%Y%m%d_%H%M%S"
 
@@ -29,7 +31,7 @@ class Segment:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build an A/B continuous-cache fallback manifest.")
-    parser.add_argument("--zone", default="南部赛区")
+    parser.add_argument("--zone", default=DEFAULT_ZONE)
     parser.add_argument("--event", default=DEFAULT_EVENT)
     parser.add_argument("--date", required=True, help="Cache date, for example 2026-05-13.")
     parser.add_argument("--role", required=True)

@@ -1,9 +1,9 @@
 # RM Monitor 2026 本机部署记录
 
-本分支用于在 `maverick-server` 单机上部署 RM Monitor 2026。当前目标是：
+本分支用于在 `maverick-server` 单机上部署 RM Monitor 2026。本届目标是：
 
 - 使用 Kubernetes/k3s 在本机运行 RM Monitor。
-- 录制 RMUC2026 区域赛官方直播源。
+- 录制 RMUC2026 复活赛与全国赛官方直播源。
 - 多视角原始 FLV 先保存在本机源目录，Bilibili 上传成功后再复制到长期目录。
 - 飞书多维表格只记录文件路径和视频链接，不上传视频文件。
 - 使用 `biliup` 将一场比赛作为一个 Bilibili 视频上传，各视角作为分 P。
@@ -11,6 +11,9 @@
 这份 README 同时作为部署台账。项目结束时，优先按本文档逐项检查；脚本只能作为辅助，不能替代人工核对。
 
 赛中/赛后运维速查见 [deploy/local/OPERATIONS.md](deploy/local/OPERATIONS.md)，其中记录了完整性审计 SQL、关停顺序、重启方式和 2026 区域赛收尾时发现的已知缺口。
+
+> [!IMPORTANT]
+> RMUC 2026 录制任务已于 `2026-08-14` 完成交接关停。7 个 Kubernetes Deployment 均已缩容为 0，所有 RM Monitor systemd 服务和 timer 已停止、禁用，本地媒体缓存已清空。最终审计结果、保留项、已知缺口和下一届启动步骤见 [deploy/local/HANDOFF_2026.md](deploy/local/HANDOFF_2026.md)。
 
 ## 仓库
 
@@ -152,15 +155,32 @@ deploy/local/biliup_upload_match.py
 
 该脚本默认从 `/mnt/PC801/rm-monitor/records` 读取源 FLV。Bilibili 投稿默认使用转载模式：`--copyright 2 --source "RoboMaster 官方直播"`。自动队列会同时运行 [deploy/local/archive_auto_queue.py](deploy/local/archive_auto_queue.py) 提前归档；上传成功后脚本会再次校验长期目录，确认 Bilibili 和归档都成功后才删除本地源文件。同一场比赛的归档、校验、删除会通过本地锁串行化，避免重复拷贝和源文件清理互相抢同一批文件。默认归档校验只检查文件大小，避免在比赛日反复读取几十 GB 的 SMB 目标文件；需要完整哈希校验时加 `--verify-checksum`。需要只上传不做归档校验/清理时加 `--no-archive-after-upload`。
 
-当前合集目标：
+当前两套合集目标：
 
-- 合集名：`RMUC2026南部赛区全视角录制`
-- 合集 ID：`8106458`
-- 分区 ID：`9007866`（正片）
-- 赛区：南部赛区
-- 标题格式：`南部第1场 小组赛 吉林大学2:0西北工业大学 | RMUC2026区域赛`
+| 官方区域 | 赛期 | Bilibili 合集 | 合集 ID | 正片分区 ID | 标题后缀 |
+| --- | --- | --- | ---: | ---: | --- |
+| `复活赛` | `2026-07-31` 至 `2026-08-02` | `RMUC2026复活赛全视角录制` | `8693730` | `9687660` | `RMUC2026复活赛` |
+| `全国赛` | `2026-08-04` 至 `2026-08-09` | `RMUC2026全国赛全视角录制` | `8694808` | `9688876` | `RMUC2026全国赛` |
 
-上传脚本默认优先使用合集 ID 和分区 ID，而不是只按合集名精确匹配；因此在 B 站后台修改合集名称不会影响后续自动上传。如果删除并重建合集，需要同步更新 `RM_MONITOR_BILI_SEASON_ID` / `RM_MONITOR_BILI_SECTION_ID` 或脚本默认值。
+标题示例：`复活赛第1场 小组赛 红方学校2:0蓝方学校 | RMUC2026复活赛`
+和 `全国赛第1场 小组赛 红方学校2:0蓝方学校 | RMUC2026全国赛`。
+
+非敏感赛事参数集中保存在
+[deploy/local/rm-monitor-event.conf](deploy/local/rm-monitor-event.conf)。本机 systemd
+队列、dashboard 和官方备用缓存服务都读取该文件。修改赛事参数后需要执行
+`sudo systemctl daemon-reload` 并重启相关服务。
+
+2026 复活赛与全国赛的最终录制和上传审计已经完成。全国赛 98 场共 1372 个最终源文件，全部上传；复活赛第 5–32 场完整，第 1–3 场无录制、第 4 场仅 1 路。最终数据与异常说明以 [deploy/local/HANDOFF_2026.md](deploy/local/HANDOFF_2026.md) 为准。
+
+上传脚本会同时校验合集 ID、合集名称和正片分区 ID，防止复活赛与全国赛串稿。如果删除、重建或重命名合集，需要同步更新 `rm-monitor-event.conf`。
+
+本届适应性训练使用独立的一次性 systemd timer：复活赛在 `2026-07-31 08:00`
+开始录制并写入复活赛合集，全国赛在 `2026-08-03 08:00` 开始录制并写入全国赛合集。复活赛训练
+因 NAS 恢复窗口延长至次日 `00:00`，实际直播约在 `20:05` 至 `21:11` 可用；其上传延后到次日中午。
+全国赛训练录制到 `2026-08-04 00:00`，上传最晚运行到 `06:00`，避开当日
+`09:00` 正赛。正赛和训练上传共用 `logs/biliup-upload-global.lock`，不会并发投稿。
+
+这些 timer 已过期且已禁用，仅作为 2026 历史配置保留。下一届必须按新赛程重建，不能直接重新启用。
 
 测试标题不要带 `RM-Monitor`，按需要使用 `录制测试`。
 
@@ -358,14 +378,14 @@ systemctl is-active rm-monitor-container-net-bypass.service
 赛区级 A/B 连续缓存是可选降级方案，默认关闭，只在重要比赛或官方误切/网络风险较高时临时启用。缓存不区分场次和 round，只按赛区、日期、视角、lane 写 60 秒 FLV 分片：
 
 ```text
-/mnt/PC801/rm-monitor/records/_continuous_cache/RMUC 2026超级对抗赛/南部赛区/YYYY-MM-DD/a/视角/YYYYMMDD_HHMMSS.flv
-/mnt/PC801/rm-monitor/records/_continuous_cache/RMUC 2026超级对抗赛/南部赛区/YYYY-MM-DD/b/视角/YYYYMMDD_HHMMSS.flv
+/mnt/PC801/rm-monitor/records/_continuous_cache/RMUC 2026超级对抗赛/全国赛/YYYY-MM-DD/a/视角/YYYYMMDD_HHMMSS.flv
+/mnt/PC801/rm-monitor/records/_continuous_cache/RMUC 2026超级对抗赛/全国赛/YYYY-MM-DD/b/视角/YYYYMMDD_HHMMSS.flv
 ```
 
 启动或重建 A/B 缓存：
 
 ```sh
-deploy/local/start_continuous_cache_jobs.py --zone 南部赛区 --res high --lanes a,b --segment-time 60 --stagger-seconds 30 --apply --replace
+deploy/local/start_continuous_cache_jobs.py --zone 全国赛 --res high --lanes a,b --segment-time 60 --stagger-seconds 30 --apply --replace
 ```
 
 关闭 A/B 缓存：
@@ -380,16 +400,16 @@ A/B 两路独立拉同一视角源，B lane 延迟 30 秒启动。赛后按确�
 
 ```sh
 deploy/local/cache_fallback_manifest.py \
-  --date 2026-05-13 \
-  --zone 南部赛区 \
+  --date 2026-08-04 \
+  --zone 全国赛 \
   --role 主视角 \
-  --start '2026-05-13 09:08:00' \
-  --end '2026-05-13 09:20:00' \
+  --start '2026-08-04 09:08:00' \
+  --end '2026-08-04 09:20:00' \
   --probe \
-  --write-concat /tmp/南部第N场-主视角.concat.txt
+  --write-concat /tmp/全国第N场-主视角.concat.txt
 ```
 
-清单无 `gaps` 时，可用 `ffmpeg -f concat -safe 0 -i /tmp/南部第N场-主视角.concat.txt -c copy 输出.flv` 生成该视角成品。正式上传前，应对 14 个视角分别生成清单并确认没有 gap。
+清单无 `gaps` 时，可用 `ffmpeg -f concat -safe 0 -i /tmp/全国第N场-主视角.concat.txt -c copy 输出.flv` 生成该视角成品。正式上传前，应对 14 个视角分别生成清单并确认没有 gap。
 
 连续缓存不会随普通上传归档自动清理。需要清理时显式启用：
 
@@ -397,7 +417,7 @@ deploy/local/cache_fallback_manifest.py \
 deploy/local/cleanup_continuous_cache.py --match-id 30902 --submit --enabled
 ```
 
-自动生成的飞书多维表格按赛区建表，例如 `RMUC 2026超级对抗赛-南部赛区`。新表字段顺序为：`场次`、`阶段`、`红方`、`蓝方`、`视角`、`文件路径`、`视频链接`；当前关闭飞书视频附件上传，因此不会创建 `录像` 附件列。
+自动生成的飞书多维表格按赛区建表，例如 `RMUC 2026超级对抗赛-全国赛`。新表字段顺序为：`场次`、`阶段`、`红方`、`蓝方`、`视角`、`文件路径`、`视频链接`；当前关闭飞书视频附件上传，因此不会创建 `录像` 附件列。
 
 ## 告警和降级
 
@@ -415,22 +435,28 @@ deploy/local/cleanup_continuous_cache.py --match-id 30902 --submit --enabled
 1. 官方状态没有自动触发录制：先看 `kubectl logs -n rm-monitor deploy/monitor --tail=100`。如果比赛已经开始，立即用宿主机应急录制：
 
 ```sh
-deploy/local/emergency_record_live.py --zone 南部赛区 --res high --name 南部第N场-手动
+deploy/local/emergency_record_live.py --zone 全国赛 --res high --name 全国第N场-手动
 ```
 
 2. Pod 内直播源异常但宿主机可访问：继续使用上面的应急录制脚本，它直接在宿主机写 `/mnt/PC801/rm-monitor/emergency`，不依赖 K8s 录制 Job。
 3. 单个视角失败：不要停止其它视角。先让正常视角录完；失败视角尝试单独用应急脚本补录，必要时降到 `--res middle`。
-4. Bilibili 上传失败：不要删源；长期归档复制可能已经并行完成，但本地源文件仍会保留。修复登录态或网络后重复执行同一条 `biliup_upload_match.py --submit`。
-5. 飞书写链接失败：Bilibili 上传优先。可先加 `--no-feishu-link` 完成上传，之后用 `--add-existing-bvid BV... --zone 南部赛区 --order N --submit` 补写链接。
+4. Bilibili 上传失败：不要删源；长期归档复制可能已经并行完成，但本地源文件仍会保留。先检查 `logs/biliup-auto-queue-submissions.json` 和日志中是否已经出现 BVID；已有 BVID 时使用 `--add-existing-bvid BV... --submit` 补完合集、飞书和归档，不能重新投稿。自动队列会持久化已发现的 BVID，并在 B 站列表接口不可用时暂停新投稿。
+5. 飞书写链接失败：Bilibili 上传优先。可先加 `--no-feishu-link` 完成上传，之后用 `--add-existing-bvid BV... --zone 全国赛 --order N --submit` 补写链接。
 6. 长期目录复制失败：源文件仍在 `/mnt/PC801`。修好 `/mnt/server_data` 后执行：
 
 ```sh
-deploy/local/archive_match_artifacts.py --zone 南部赛区 --order N --submit
+deploy/local/archive_match_artifacts.py --zone 全国赛 --order N --submit
 ```
 
-确认 Bilibili 上传也成功后，再执行 `deploy/local/archive_match_artifacts.py --zone 南部赛区 --order N --submit --delete-source-only` 清理本地源文件。
+确认 Bilibili 上传也成功后，再执行 `deploy/local/archive_match_artifacts.py --zone 全国赛 --order N --submit --delete-source-only` 清理本地源文件。
 
 7. `/mnt/PC801` 空间不足：停止非必要写入，优先保留当前比赛源 FLV；不要在复制到长期目录并校验前手动删除源文件。
+
+宿主机正赛备用录制和适应性训练录制均采用本地优先策略。NAS
+不可达时继续写入 `/mnt/PC801`，只暂停长期归档和本地源清理；NAS
+恢复后会在后续归档轮次补拷。每分钟运行的集群守护同时重放容器直连
+路由，并从 `record-dispatcher` 内验证 Kubernetes API `/livez`，避免调度器
+因 API 路由断开而无法创建录制 Job。
 
 ## 快速验证
 

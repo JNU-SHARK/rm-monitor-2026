@@ -1,0 +1,11 @@
+[Unit]
+Description=Start national adaptive training recorder on 2026-08-03
+
+[Timer]
+OnCalendar=2026-08-03 08:00:00 Asia/Taipei
+AccuracySec=1s
+Persistent=true
+Unit=rm-monitor-adaptive-training-recorder-national.service
+
+[Install]
+WantedBy=timers.target

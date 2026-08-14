@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -15,6 +16,10 @@ import local_log
 SERVICE = "cluster-dns-guard"
 DEFAULT_NAMESPACE = "rm-monitor"
 DEFAULT_EXEC_TARGET = "deploy/monitor"
+DEFAULT_API_EXEC_TARGET = "deploy/record-dispatcher"
+DEFAULT_API_URL = "https://10.43.0.1:443/livez"
+DEFAULT_NAS_MOUNT = "/mnt/server_data"
+DEFAULT_NAS_PROBE_DIR = "/mnt/server_data/rm-monitor/records"
 DEFAULT_SCHEDULE_URL = "https://pro-robomasters-hz-n5i3.oss-cn-hangzhou.aliyuncs.com/live_json/schedule.json"
 DEFAULT_STATE_FILE = Path(__file__).resolve().parents[2] / "logs" / "cluster-dns-guard-state.json"
 DEFAULT_UPSTREAMS = ("223.5.5.5", "223.6.6.6")
@@ -25,6 +30,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Guard cluster DNS and official schedule access.")
     parser.add_argument("--namespace", default=DEFAULT_NAMESPACE)
     parser.add_argument("--exec-target", default=DEFAULT_EXEC_TARGET)
+    parser.add_argument("--api-exec-target", default=DEFAULT_API_EXEC_TARGET)
+    parser.add_argument("--api-url", default=DEFAULT_API_URL)
+    parser.add_argument("--nas-mount", default=DEFAULT_NAS_MOUNT)
+    parser.add_argument("--nas-probe-dir", default=DEFAULT_NAS_PROBE_DIR)
     parser.add_argument("--schedule-url", default=DEFAULT_SCHEDULE_URL)
     parser.add_argument("--upstream", action="append", default=[])
     parser.add_argument("--timeout", type=int, default=10)
@@ -64,6 +73,14 @@ def main() -> int:
     schedule_error = probe_schedule_from_cluster(args)
     if schedule_error:
         issues.append(schedule_error)
+
+    api_error = probe_kubernetes_api_from_cluster(args)
+    if api_error:
+        issues.append(api_error)
+
+    nas_error = probe_nas_write(args)
+    if nas_error:
+        issues.append(nas_error)
 
     if issues:
         local_log.log_event(SERVICE, "ERROR", "cluster DNS guard failed", issues=issues, repairs=repairs)
@@ -167,6 +184,45 @@ def probe_schedule_from_cluster(args: argparse.Namespace) -> str:
     return f"cluster cannot resolve/fetch schedule.json: {summarize_result(result)}"
 
 
+def probe_kubernetes_api_from_cluster(args: argparse.Namespace) -> str:
+    token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    command = (
+        f"token=$(cat {shlex.quote(token_path)}) "
+        f"&& test \"$(wget -qO- --no-check-certificate -T {int(args.timeout)} "
+        f"--header=\"Authorization: Bearer $token\" {shlex.quote(args.api_url)})\" = ok"
+    )
+    result = run(
+        ["kubectl", "exec", "-n", args.namespace, args.api_exec_target, "--", "sh", "-lc", command],
+        timeout=args.timeout + 10,
+    )
+    if result.returncode == 0:
+        return ""
+    return f"record dispatcher cannot reach Kubernetes API: {summarize_result(result)}"
+
+
+def probe_nas_write(args: argparse.Namespace) -> str:
+    mount = Path(args.nas_mount)
+    root = Path(args.nas_probe_dir)
+    if not os.path.ismount(mount):
+        return f"NAS mount is absent: {mount}"
+    last_error = "unknown error"
+    for attempt in range(3):
+        probe = root / f".rm-monitor-write-probe.{os.getpid()}.{time.time_ns()}"
+        try:
+            probe.mkdir()
+            probe.rmdir()
+            return ""
+        except OSError as exc:
+            last_error = str(exc)
+            try:
+                probe.rmdir()
+            except OSError:
+                pass
+            if attempt < 2:
+                time.sleep(1)
+    return f"NAS record target is not writable after 3 attempts: {last_error}"
+
+
 def maybe_send_alert(args: argparse.Namespace, issues: list[str], repairs: list[str]) -> None:
     if not args.alert:
         return
@@ -184,14 +240,14 @@ def maybe_send_alert(args: argparse.Namespace, issues: list[str], repairs: list[
 
         text = "\n".join(
             [
-                "Cluster DNS / schedule guard failed.",
+                "Cluster DNS / schedule / storage guard failed.",
                 "Issues:",
                 *[f"- {item}" for item in issues],
                 "Repairs:",
                 *[f"- {item}" for item in (repairs or ["none"])],
             ]
         )
-        send_feishu_alert(args, "RM Monitor cluster DNS failed", text)
+        send_feishu_alert(args, "RM Monitor infrastructure guard failed", text)
         state["last_alert_fingerprint"] = fingerprint
         state["last_alert_at_ts"] = now
         write_state(state_path, state)

@@ -14,18 +14,22 @@ from pathlib import Path
 import local_log
 
 
-SERVICE = "biliup-auto-queue"
-DEFAULT_ZONE = "南部赛区"
+SERVICE = os.environ.get("RM_MONITOR_SERVICE_NAME", "biliup-auto-queue")
+DEFAULT_ZONE = os.environ.get("RM_MONITOR_ZONE", "全国赛")
 DEFAULT_LIMIT = "7"
 DEFAULT_BILIUP = "deploy/local/biliup_direct_docker.sh"
 DEFAULT_RECORDS_ROOT = "/mnt/PC801/rm-monitor/records"
 DEFAULT_BILI_SUBMIT = "web"
+DEFAULT_TITLE_SUFFIX = os.environ.get("RM_MONITOR_TITLE_SUFFIX", "")
 DEFAULT_SEASON_NAME = os.environ.get("RM_MONITOR_BILI_SEASON_NAME", "")
 DEFAULT_SEASON_ID = os.environ.get("RM_MONITOR_BILI_SEASON_ID", "")
 DEFAULT_SECTION_ID = os.environ.get("RM_MONITOR_BILI_SECTION_ID", "")
 DEFAULT_LOCK_FILE = Path(__file__).resolve().parents[2] / "logs" / "biliup-auto-queue.lock"
+DEFAULT_UPLOAD_LOCK_FILE = Path(__file__).resolve().parents[2] / "logs" / "biliup-upload-global.lock"
+DEFAULT_SUBMISSION_STATE_FILE = Path(__file__).resolve().parents[2] / "logs" / "biliup-auto-queue-submissions.json"
 RATE_LIMIT_RETRY_SECONDS = 45 * 60
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+BVID_RE = re.compile(r"\bBV[0-9A-Za-z]{10,}\b")
 
 
 @dataclass
@@ -51,6 +55,7 @@ def main() -> int:
         help="biliup final submit API.",
     )
     parser.add_argument("--records-root", default=DEFAULT_RECORDS_ROOT)
+    parser.add_argument("--title-suffix", default=DEFAULT_TITLE_SUFFIX)
     parser.add_argument("--season-name", default=DEFAULT_SEASON_NAME)
     parser.add_argument("--season-id", default=DEFAULT_SEASON_ID)
     parser.add_argument("--section-id", default=DEFAULT_SECTION_ID)
@@ -62,6 +67,8 @@ def main() -> int:
     parser.add_argument("--poll-seconds", type=int, default=60)
     parser.add_argument("--settle-seconds", type=int, default=300)
     parser.add_argument("--lock-file", default=str(DEFAULT_LOCK_FILE))
+    parser.add_argument("--upload-lock-file", default=str(DEFAULT_UPLOAD_LOCK_FILE))
+    parser.add_argument("--submission-state-file", default=str(DEFAULT_SUBMISSION_STATE_FILE))
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
@@ -106,33 +113,57 @@ def main() -> int:
                 time.sleep(min(args.poll_seconds, max(1, int(retry_at - time.time()))))
                 continue
 
+            upload_lock = try_acquire_upload_lock(Path(args.upload_lock_file))
+            if upload_lock is None:
+                local_log.log_event(
+                    SERVICE,
+                    "INFO",
+                    "global Bilibili upload lane is busy; waiting",
+                    match_id=candidate.match_id,
+                    order=candidate.order,
+                    lock_file=args.upload_lock_file,
+                )
+                if args.once:
+                    return 0
+                time.sleep(args.poll_seconds)
+                continue
+            if upload_process_running():
+                release_lock(upload_lock)
+                local_log.log_event(SERVICE, "INFO", "another Bilibili upload started outside the queue; waiting")
+                if args.once:
+                    return 0
+                time.sleep(args.poll_seconds)
+                continue
             try:
-                code = handle_candidate(args, candidate)
-            except SystemExit as exc:
-                code, detail = local_log.normalize_exit(exc.code)
-                if code == 0 and detail:
+                try:
+                    code = handle_candidate(args, candidate)
+                except SystemExit as exc:
+                    code, detail = local_log.normalize_exit(exc.code)
+                    if code == 0 and detail:
+                        code = 1
+                    local_log.log_event(
+                        SERVICE,
+                        "ERROR" if code else "INFO",
+                        "candidate workflow failed" if code else "candidate workflow finished",
+                        match_id=candidate.match_id,
+                        order=candidate.order,
+                        exit_code=code,
+                        detail=detail,
+                    )
+                except Exception as exc:
                     code = 1
-                local_log.log_event(
-                    SERVICE,
-                    "ERROR" if code else "INFO",
-                    "candidate workflow failed" if code else "candidate workflow finished",
-                    match_id=candidate.match_id,
-                    order=candidate.order,
-                    exit_code=code,
-                    detail=detail,
-                )
-            except Exception as exc:
-                code = 1
-                local_log.log_event(
-                    SERVICE,
-                    "ERROR",
-                    "candidate workflow crashed",
-                    match_id=candidate.match_id,
-                    order=candidate.order,
-                    exit_code=code,
-                    error=str(exc),
-                    traceback=traceback.format_exc(limit=6),
-                )
+                    local_log.log_event(
+                        SERVICE,
+                        "ERROR",
+                        "candidate workflow crashed",
+                        match_id=candidate.match_id,
+                        order=candidate.order,
+                        exit_code=code,
+                        error=str(exc),
+                        traceback=traceback.format_exc(limit=6),
+                    )
+            finally:
+                release_lock(upload_lock)
             if code != 0:
                 failures[candidate.match_id] = time.time() + (RATE_LIMIT_RETRY_SECONDS if code == 75 else 10 * 60)
             if args.once:
@@ -154,6 +185,26 @@ def acquire_lock(path: Path):
     lock.truncate()
     lock.flush()
     return lock
+
+
+def try_acquire_upload_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock = path.open("a+")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        return None
+    lock.seek(0)
+    lock.truncate()
+    lock.write(f"{SERVICE} {os.getpid()}\n")
+    lock.flush()
+    return lock
+
+
+def release_lock(lock) -> None:
+    fcntl.flock(lock, fcntl.LOCK_UN)
+    lock.close()
 
 
 def upload_process_running() -> bool:
@@ -241,7 +292,16 @@ def handle_candidate(args: argparse.Namespace, candidate: Candidate) -> int:
 
     plan = upload_plan(args, candidate)
     title = str(plan.get("title") or "")
-    existing_bvid = find_existing_bvid(args, title) if title else ""
+    existing_bvid = cached_submission_bvid(Path(args.submission_state_file), candidate, title)
+    if not existing_bvid and title:
+        existing_bvid, list_ok, rate_limited = find_existing_bvid(args, title)
+        if not list_ok:
+            # Never submit while the duplicate check is unavailable.  This is
+            # especially important for Bilibili -509 responses after a prior
+            # submit whose archive/post-processing subsequently failed.
+            return 75 if rate_limited else 1
+        if existing_bvid:
+            remember_submission(Path(args.submission_state_file), candidate, title, existing_bvid)
     if existing_bvid:
         command = base_command(args, candidate) + ["--biliup", args.biliup, "--add-existing-bvid", existing_bvid, "--submit"]
         action = "complete existing Bilibili upload"
@@ -273,13 +333,29 @@ def handle_candidate(args: argparse.Namespace, candidate: Candidate) -> int:
     if args.dry_run:
         print(shell_join(command))
         return 0
-    code = run_streaming(command)
+    observed_bvid = ""
+
+    def persist_observed_bvid(value: str) -> None:
+        nonlocal observed_bvid
+        if value == observed_bvid:
+            return
+        observed_bvid = value
+        remember_submission(Path(args.submission_state_file), candidate, title, value)
+
+    code, output = run_streaming(command, persist_observed_bvid)
+    output_bvid = find_bvid_in_text(output)
+    if output_bvid:
+        remember_submission(Path(args.submission_state_file), candidate, title, output_bvid)
+        bvid = output_bvid
+    if code != 0 and is_bili_rate_limited(output):
+        code = 75
     local_log.log_event(
         SERVICE,
         "INFO" if code == 0 else "ERROR",
         "candidate workflow finished" if code == 0 else "candidate workflow failed",
         match_id=candidate.match_id,
         order=candidate.order,
+        bvid=bvid,
         exit_code=code,
     )
     return code
@@ -328,6 +404,8 @@ def base_command(args: argparse.Namespace, candidate: Candidate) -> list[str]:
     ]
     if args.season_name:
         command.extend(["--season-name", args.season_name])
+    if args.title_suffix:
+        command.extend(["--title-suffix", args.title_suffix])
     if args.season_id:
         command.extend(["--season-id", str(args.season_id)])
     if args.section_id:
@@ -335,31 +413,100 @@ def base_command(args: argparse.Namespace, candidate: Candidate) -> list[str]:
     return command
 
 
-def find_existing_bvid(args: argparse.Namespace, title: str) -> str:
+def find_existing_bvid(args: argparse.Namespace, title: str) -> tuple[str, bool, bool]:
     result = subprocess.run([args.biliup, "--user-cookie", args.cookie, "list"], text=True, capture_output=True)
     if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
         local_log.log_event(
             SERVICE,
             "WARNING",
             "failed to list Bilibili archives",
             exit_code=result.returncode,
-            detail=result.stderr.strip() or result.stdout.strip(),
+            detail=detail,
         )
-        return ""
+        return "", False, is_bili_rate_limited(detail)
     for line in result.stdout.splitlines():
         clean = ANSI_RE.sub("", line)
         parts = clean.split("\t")
         if len(parts) >= 2 and parts[1].strip() == title:
-            return parts[0].strip()
-    return ""
+            return parts[0].strip(), True, False
+    return "", True, False
 
 
-def run_streaming(command: list[str]) -> int:
+def run_streaming(command: list[str], on_bvid=None) -> tuple[int, str]:
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     assert process.stdout is not None
+    output: list[str] = []
     for line in process.stdout:
+        output.append(line)
         print(line, end="")
-    return process.wait()
+        bvid = find_bvid_in_text(line)
+        if bvid and on_bvid is not None:
+            on_bvid(bvid)
+    return process.wait(), "".join(output)
+
+
+def find_bvid_in_text(output: str) -> str:
+    matches = BVID_RE.findall(output)
+    return matches[-1] if matches else ""
+
+
+def is_bili_rate_limited(output: str) -> bool:
+    return any(
+        token in output
+        for token in (
+            "投稿过于频繁",
+            "请求过于频繁",
+            "code: 21566",
+            '"code":21566',
+            "code: -509",
+            '"code":-509',
+        )
+    )
+
+
+def cached_submission_bvid(path: Path, candidate: Candidate, title: str) -> str:
+    state = load_submission_state(path)
+    record = state.get("submissions", {}).get(candidate.match_id, {})
+    if record.get("title") != title:
+        return ""
+    bvid = str(record.get("bvid") or "")
+    return bvid if BVID_RE.fullmatch(bvid) else ""
+
+
+def remember_submission(path: Path, candidate: Candidate, title: str, bvid: str) -> None:
+    if not BVID_RE.fullmatch(bvid):
+        return
+    state = load_submission_state(path)
+    state.setdefault("version", 1)
+    state.setdefault("submissions", {})[candidate.match_id] = {
+        "match_id": candidate.match_id,
+        "zone": candidate.zone,
+        "order": candidate.order,
+        "title": title,
+        "bvid": bvid,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{time.time_ns()}")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(state, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    tmp.replace(path)
+
+
+def load_submission_state(path: Path) -> dict:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, dict):
+            data.setdefault("submissions", {})
+            return data
+    except (OSError, ValueError):
+        pass
+    return {"version": 1, "submissions": {}}
 
 
 def psql(args: argparse.Namespace, query: str) -> list[list[str]]:

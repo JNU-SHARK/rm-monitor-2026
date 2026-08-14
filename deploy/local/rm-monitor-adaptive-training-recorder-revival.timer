@@ -1,0 +1,11 @@
+[Unit]
+Description=Start revival adaptive training recorder on 2026-07-31
+
+[Timer]
+OnCalendar=2026-07-31 08:00:00 Asia/Taipei
+AccuracySec=1s
+Persistent=true
+Unit=rm-monitor-adaptive-training-recorder-revival.service
+
+[Install]
+WantedBy=timers.target

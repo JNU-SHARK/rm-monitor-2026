@@ -1,0 +1,19 @@
+[Unit]
+Description=RM Monitor national adaptive training recorder (2026-08-03)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=maverick
+Group=maverick
+WorkingDirectory=/home/maverick/RM/rm-monitor-2026
+Environment=HOME=/home/maverick
+Environment=PYTHONUNBUFFERED=1
+Environment=RM_MONITOR_SERVICE_NAME=adaptive-training-recorder-national
+EnvironmentFile=/home/maverick/RM/rm-monitor-2026/deploy/local/rm-monitor-event.conf
+ExecStart=/usr/bin/python3 /home/maverick/RM/rm-monitor-2026/deploy/local/adaptive_training_recorder.py --event ${RM_MONITOR_EVENT_NAME} --zone ${RM_MONITOR_NATIONAL_ZONE} --date 2026-08-03 --timezone Asia/Taipei --res high --source-root /mnt/PC801/rm-monitor/adaptive-training --target-root /mnt/server_data/rm-monitor/records --segment-time 3600 --settle-seconds 180 --poll-seconds 30 --stop-at 2026-08-04T00:00:00+08:00 --lock-file /home/maverick/RM/rm-monitor-2026/logs/adaptive-training-recorder-national-2026-08-03.lock
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGINT
+TimeoutStopSec=120

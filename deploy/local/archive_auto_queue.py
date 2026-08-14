@@ -12,8 +12,8 @@ from pathlib import Path
 import local_log
 
 
-SERVICE = "archive-auto-queue"
-DEFAULT_ZONE = "南部赛区"
+SERVICE = os.environ.get("RM_MONITOR_SERVICE_NAME", "archive-auto-queue")
+DEFAULT_ZONE = os.environ.get("RM_MONITOR_ZONE", "全国赛")
 DEFAULT_RECORDS_ROOT = "/mnt/PC801/rm-monitor/records"
 DEFAULT_ARCHIVE_TARGET_ROOT = "/mnt/server_data/rm-monitor/records"
 DEFAULT_LOCK_FILE = Path(__file__).resolve().parents[2] / "logs" / "archive-auto-queue.lock"

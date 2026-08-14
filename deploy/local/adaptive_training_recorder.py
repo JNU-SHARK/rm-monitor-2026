@@ -25,7 +25,7 @@ DEFAULT_SOURCE_ROOT = "/mnt/PC801/rm-monitor/adaptive-training"
 DEFAULT_TARGET_ROOT = "/mnt/server_data/rm-monitor/records"
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_LOCK_DIR = Path(__file__).resolve().parents[2] / "logs"
-SERVICE = "adaptive-training-recorder"
+SERVICE = os.environ.get("RM_MONITOR_SERVICE_NAME", "adaptive-training-recorder")
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36"
 
 
@@ -106,7 +106,7 @@ def main() -> int:
             return 0
 
         source_session.mkdir(parents=True, exist_ok=True)
-        target_session.mkdir(parents=True, exist_ok=True)
+        ensure_archive_target(target_session)
         local_log.log_event(
             SERVICE,
             "INFO",
@@ -346,6 +346,8 @@ def stop_recorder(recorder: Recorder, reason: str) -> None:
 def archive_segments(source_session: Path, target_session: Path, recorders: dict[str, Recorder], settle_seconds: int, force: bool) -> None:
     if not source_session.exists():
         return
+    if not ensure_archive_target(target_session):
+        return
     running_current = set()
     if not force:
         for recorder in recorders.values():
@@ -364,9 +366,20 @@ def archive_segments(source_session: Path, target_session: Path, recorders: dict
         if not force and now - source.stat().st_mtime < settle_seconds:
             continue
         target = target_session / source.relative_to(source_session)
-        if copy_if_needed(source, target, force=force):
-            copied += 1
-            local_log.log_event(SERVICE, "INFO", "segment archived", source=str(source), target=str(target), size=target.stat().st_size)
+        try:
+            if copy_if_needed(source, target, force=force):
+                copied += 1
+                local_log.log_event(SERVICE, "INFO", "segment archived", source=str(source), target=str(target), size=target.stat().st_size)
+        except (OSError, RuntimeError) as exc:
+            local_log.log_event(
+                SERVICE,
+                "WARN",
+                "segment archive deferred; local source retained",
+                source=str(source),
+                target=str(target),
+                error=str(exc),
+            )
+            return
     if copied:
         local_log.log_event(SERVICE, "INFO", "archive pass completed", copied=copied, force=force)
 
@@ -390,8 +403,23 @@ def copy_if_needed(source: Path, target: Path, force: bool) -> bool:
         if tmp.exists():
             tmp.unlink()
     if target.stat().st_size != after.st_size:
-        raise SystemExit(f"archive copy size mismatch: {source} => {target}")
+        raise RuntimeError(f"archive copy size mismatch: {source} => {target}")
     return True
+
+
+def ensure_archive_target(target_session: Path) -> bool:
+    try:
+        target_session.mkdir(parents=True, exist_ok=True)
+        return True
+    except OSError as exc:
+        local_log.log_event(
+            SERVICE,
+            "WARN",
+            "archive target unavailable; recording continues locally",
+            target_dir=str(target_session),
+            error=str(exc),
+        )
+        return False
 
 
 def newest_flv(path: Path) -> Path | None:

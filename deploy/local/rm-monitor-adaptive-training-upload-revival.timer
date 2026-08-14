@@ -1,0 +1,11 @@
+[Unit]
+Description=Start revival adaptive training upload after the match-day queue
+
+[Timer]
+OnCalendar=2026-08-01 12:00:00 Asia/Taipei
+AccuracySec=1s
+Persistent=true
+Unit=rm-monitor-adaptive-training-upload-revival.service
+
+[Install]
+WantedBy=timers.target

@@ -41,5 +41,10 @@ deploy/local/cleanup.sh --confirm --uninstall-biliup
 deploy/local/cleanup.sh --confirm --uninstall-k3s
 ```
 
+`--delete-data` deletes both `/mnt/PC801/rm-monitor/records` and the long-term
+NAS directory `/mnt/server_data/rm-monitor/records`. It is not appropriate for
+a normal season handoff. Follow [HANDOFF_2026.md](HANDOFF_2026.md) and remove
+only verified local caches while retaining the NAS archive.
+
 Use `--uninstall-k3s` only if this machine no longer needs the Kubernetes
 cluster for anything else.

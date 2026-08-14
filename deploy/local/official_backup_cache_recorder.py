@@ -15,9 +15,9 @@ import adaptive_training_recorder as recorder
 import local_log
 
 
-SERVICE = "official-backup-cache"
-DEFAULT_EVENT = "RMUC 2026超级对抗赛"
-DEFAULT_ZONE = "东部赛区"
+SERVICE = os.environ.get("RM_MONITOR_SERVICE_NAME", "official-backup-cache")
+DEFAULT_EVENT = os.environ.get("RM_MONITOR_EVENT_NAME", "RMUC 2026超级对抗赛")
+DEFAULT_ZONE = os.environ.get("RM_MONITOR_ZONE", "全国赛")
 DEFAULT_SESSION_NAME = "正赛备用缓存"
 DEFAULT_LIVE_INFO_URL = "https://rm-static.djicdn.com/live_json/live_game_info.json"
 DEFAULT_SCHEDULE_URL = "https://pro-robomasters-hz-n5i3.oss-cn-hangzhou.aliyuncs.com/live_json/schedule.json"
@@ -193,7 +193,7 @@ def main() -> int:
                 continue
 
             source_session.mkdir(parents=True, exist_ok=True)
-            target_session.mkdir(parents=True, exist_ok=True)
+            recorder.ensure_archive_target(target_session)
             try:
                 desired = recorder.load_roles(args.live_info_url, args.zone, args.res)
             except Exception as exc:
@@ -431,9 +431,20 @@ def prune_archived_sources(
         if not force and now - source.stat().st_mtime < settle_seconds:
             continue
         target = target_session / source.relative_to(source_session)
-        if target.is_file() and target.stat().st_size == source.stat().st_size:
-            source.unlink()
-            removed += 1
+        try:
+            if target.is_file() and target.stat().st_size == source.stat().st_size:
+                source.unlink()
+                removed += 1
+        except OSError as exc:
+            local_log.log_event(
+                SERVICE,
+                "WARN",
+                "local cache pruning deferred; archive target unavailable",
+                source=str(source),
+                target=str(target),
+                error=str(exc),
+            )
+            return
     if removed:
         local_log.log_event(SERVICE, "INFO", "local archived segments pruned", removed=removed, source_dir=str(source_session))
 

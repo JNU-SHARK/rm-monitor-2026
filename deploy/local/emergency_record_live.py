@@ -14,11 +14,12 @@ import local_log
 
 DEFAULT_LIVE_INFO_URL = "https://rm-static.djicdn.com/live_json/live_game_info.json"
 DEFAULT_OUTPUT_ROOT = "/mnt/PC801/rm-monitor/emergency"
+DEFAULT_ZONE = os.environ.get("RM_MONITOR_ZONE", "全国赛")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Emergency host-side RM live recorder.")
-    parser.add_argument("--zone", default="南部赛区")
+    parser.add_argument("--zone", default=DEFAULT_ZONE)
     parser.add_argument("--res", default="high", choices=("high", "middle", "low"))
     parser.add_argument("--live-info-url", default=DEFAULT_LIVE_INFO_URL)
     parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT)

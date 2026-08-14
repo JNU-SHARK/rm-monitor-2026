@@ -3,6 +3,11 @@
 This note is the quick runbook for future local deployments on `maverick-server`.
 The root `README.md` is still the detailed deployment ledger.
 
+The 2026 season is shut down. Before operating this host, read
+[HANDOFF_2026.md](HANDOFF_2026.md). It records the final audit, retained state,
+known gaps, and the next-season reset checklist. Do not re-enable the dated
+2026 adaptive-training timers.
+
 ## Fixed Local Paths
 
 - Repo: `/home/maverick/RM/rm-monitor-2026`
@@ -25,30 +30,78 @@ Apply local Kubernetes resources:
 kubectl apply -k deploy/local
 ```
 
-Start local services for a live event:
+After replacing every event-specific value and dated unit for a new season,
+start the required local services. The following list describes the 2026
+layout and must not be run unchanged:
 
 ```sh
 sudo systemctl start rm-monitor-container-net-bypass.service
 sudo systemctl start rm-monitor-dashboard.service
+sudo systemctl start rm-monitor-official-backup-cache.service
+sudo systemctl start rm-monitor-official-backup-cache-revival.service
 sudo systemctl start rm-monitor-archive-auto-queue.service
+sudo systemctl start rm-monitor-archive-auto-queue-revival.service
 sudo systemctl start rm-monitor-biliup-auto-queue.service
+sudo systemctl start rm-monitor-biliup-auto-queue-revival.service
 sudo systemctl start rm-monitor-cluster-dns-guard.timer
 ```
 
-For a new region, update the two queue service files before starting:
+Non-secret event parameters are centralized in:
 
-- `deploy/local/rm-monitor-archive-auto-queue.service`
-- `deploy/local/rm-monitor-biliup-auto-queue.service`
-
-The important fields are `--zone`, `--start-order`, `--season-name`,
-`--season-id`, and `--section-id`. The most recent committed service command
-was for North:
-
-```sh
---zone 北部赛区 --season-name RMUC2026北部赛区全视角录制 --season-id 8209772 --section-id 9124491
+```text
+deploy/local/rm-monitor-event.conf
 ```
 
-Reload systemd after editing installed unit files:
+The current configuration runs revival and national queues in parallel:
+
+```text
+复活赛: RMUC2026复活赛全视角录制 / 8693730 / 9687660
+全国赛: RMUC2026全国赛全视角录制 / 8694808 / 9688876
+```
+
+The `复活赛` services use `*-revival.service` and zone-specific lock/log
+files. The unsuffixed queue and backup services are the `全国赛` instances.
+The revival, national, and adaptive-training Bilibili queues share
+`logs/biliup-upload-global.lock`, so only one automated upload workflow can run
+at a time.
+
+## 2026 Finals Adaptive Training
+
+The one-shot timers were installed separately from the old regional training
+timers. They are now disabled and retained only as 2026 examples:
+
+| Session | Recorder window (Asia/Taipei) | Upload window | Bilibili collection |
+| --- | --- | --- | --- |
+| Revival adaptive training | `2026-07-31 08:00` to `2026-08-01 00:00` | `2026-08-01 12:00` to `2026-08-02 06:00` | `RMUC2026复活赛全视角录制` |
+| National adaptive training | `2026-08-03 08:00` to `2026-08-04 00:00` | `2026-08-03 08:10` to `2026-08-04 06:00` | `RMUC2026全国赛全视角录制` |
+
+The revival window was extended through midnight during the NAS recovery; the
+live source was actually available from about 20:05 to 21:11. Its timer still
+defers uploads to the next day, although the service may be started manually
+after a verified NAS archive. National uploads finish
+three hours before the first scheduled national match at 09:00 on August 4.
+All training recordings are first written below
+`/mnt/PC801/rm-monitor/adaptive-training` and verified copies are retained below
+`/mnt/server_data/rm-monitor/records`.
+
+Recorder processes are local-first. If the NAS target is unavailable, recording
+continues below `/mnt/PC801`; archive/prune is deferred until the target returns.
+The Bilibili queues persist a discovered BVID before collection/edit/archive
+post-processing and refuse a fresh submit while the remote duplicate check is
+unavailable.
+The minute-level cluster guard also performs a real create/remove probe below
+`/mnt/server_data/rm-monitor/records`; three consecutive write failures raise
+an alert while local-first recording continues.
+
+```sh
+systemctl list-timers --all \
+  rm-monitor-adaptive-training-recorder-revival.timer \
+  rm-monitor-adaptive-training-upload-revival.timer \
+  rm-monitor-adaptive-training-recorder-national.timer \
+  rm-monitor-adaptive-training-upload-national.timer
+```
+
+Reload and restart systemd units after editing the event configuration:
 
 ```sh
 sudo systemctl daemon-reload
@@ -145,14 +198,22 @@ Use this order at the end of a region or event:
 ```sh
 sudo systemctl stop \
   rm-monitor-archive-auto-queue.service \
+  rm-monitor-archive-auto-queue-revival.service \
   rm-monitor-biliup-auto-queue.service \
+  rm-monitor-biliup-auto-queue-revival.service \
+  rm-monitor-official-backup-cache.service \
+  rm-monitor-official-backup-cache-revival.service \
   rm-monitor-dashboard.service \
   rm-monitor-cluster-dns-guard.timer \
-  rm-monitor-adaptive-training-recorder.timer \
-  rm-monitor-adaptive-training-upload.timer \
+  rm-monitor-adaptive-training-recorder-revival.timer \
+  rm-monitor-adaptive-training-upload-revival.timer \
+  rm-monitor-adaptive-training-recorder-national.timer \
+  rm-monitor-adaptive-training-upload-national.timer \
   rm-monitor-cluster-dns-guard.service \
-  rm-monitor-adaptive-training-recorder.service \
-  rm-monitor-adaptive-training-upload.service \
+  rm-monitor-adaptive-training-recorder-revival.service \
+  rm-monitor-adaptive-training-upload-revival.service \
+  rm-monitor-adaptive-training-recorder-national.service \
+  rm-monitor-adaptive-training-upload-national.service \
   rm-monitor-container-net-bypass.service \
   rm-monitor-proxy-relay.service
 
@@ -161,6 +222,24 @@ kubectl scale deployment --all -n rm-monitor --replicas=0
 kubectl delete pods --all -n rm-monitor --wait=false
 sudo systemctl reset-failed rm-monitor-proxy-relay.service
 ```
+
+For a season handoff, also disable the enabled units so an old event cannot
+restart after a reboot:
+
+```sh
+sudo systemctl disable --now \
+  rm-monitor-archive-auto-queue.service \
+  rm-monitor-biliup-auto-queue.service \
+  rm-monitor-official-backup-cache.service \
+  rm-monitor-dashboard.service \
+  rm-monitor-cluster-dns-guard.timer \
+  rm-monitor-container-net-bypass.service \
+  rm-monitor-proxy-relay.service
+```
+
+Stopping `rm-monitor-container-net-bypass.service` does not remove rules that
+its oneshot command already installed. Inspect `ip rule show` and use the
+normal cleanup script only when the host no longer needs those rules.
 
 Final shutdown check:
 
@@ -195,3 +274,6 @@ After queries, scale it back down:
 ```sh
 kubectl scale deployment/postgres -n rm-monitor --replicas=0
 ```
+
+Do not use `kubectl apply -k deploy/local` for a database-only audit: it also
+restores the desired replica count of the other deployments.

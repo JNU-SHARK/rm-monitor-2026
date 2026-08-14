@@ -1,0 +1,11 @@
+[Unit]
+Description=Start national adaptive training upload queue on 2026-08-03
+
+[Timer]
+OnCalendar=2026-08-03 08:10:00 Asia/Taipei
+AccuracySec=1s
+Persistent=true
+Unit=rm-monitor-adaptive-training-upload-national.service
+
+[Install]
+WantedBy=timers.target

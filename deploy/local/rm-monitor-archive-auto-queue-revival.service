@@ -1,7 +1,7 @@
 [Unit]
-Description=RM Monitor local dashboard
-After=network-online.target k3s.service
+Description=RM Monitor revival archive auto queue
 Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
@@ -11,10 +11,11 @@ WorkingDirectory=/home/maverick/RM/rm-monitor-2026
 Environment=HOME=/home/maverick
 Environment=KUBECONFIG=/home/maverick/.kube/config
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=RM_MONITOR_SERVICE_NAME=archive-auto-queue-revival
 EnvironmentFile=/home/maverick/RM/rm-monitor-2026/deploy/local/rm-monitor-event.conf
-ExecStart=/usr/bin/python3 deploy/local/dashboard.py --host 0.0.0.0 --port 18080
-Restart=always
-RestartSec=3
+ExecStart=/usr/bin/python3 deploy/local/archive_auto_queue.py --zone ${RM_MONITOR_REVIVAL_ZONE} --start-order 1 --poll-seconds 60 --lock-file /home/maverick/RM/rm-monitor-2026/logs/archive-auto-queue-revival.lock
+Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target

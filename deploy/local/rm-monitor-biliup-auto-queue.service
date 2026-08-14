@@ -1,5 +1,5 @@
 [Unit]
-Description=RM Monitor Bilibili auto queue
+Description=RM Monitor national Bilibili auto queue
 Wants=network-online.target docker.service
 After=network-online.target docker.service
 
@@ -11,7 +11,8 @@ WorkingDirectory=/home/maverick/RM/rm-monitor-2026
 Environment=HOME=/home/maverick
 Environment=KUBECONFIG=/home/maverick/.kube/config
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=/usr/bin/python3 deploy/local/biliup_auto_queue.py --zone 北部赛区 --start-order 1 --limit 7 --season-name RMUC2026北部赛区全视角录制 --season-id 8209772 --section-id 9124491 --biliup deploy/local/biliup_direct_docker.sh --cookie /home/maverick/RM/rm-monitor-2026/cookies.json --poll-seconds 60
+EnvironmentFile=/home/maverick/RM/rm-monitor-2026/deploy/local/rm-monitor-event.conf
+ExecStart=/usr/bin/python3 deploy/local/biliup_auto_queue.py --zone ${RM_MONITOR_NATIONAL_ZONE} --start-order 1 --limit 7 --title-suffix ${RM_MONITOR_NATIONAL_TITLE_SUFFIX} --season-name ${RM_MONITOR_NATIONAL_BILI_SEASON_NAME} --season-id ${RM_MONITOR_NATIONAL_BILI_SEASON_ID} --section-id ${RM_MONITOR_NATIONAL_BILI_SECTION_ID} --biliup deploy/local/biliup_direct_docker.sh --cookie /home/maverick/RM/rm-monitor-2026/cookies.json --poll-seconds 60 --lock-file /home/maverick/RM/rm-monitor-2026/logs/biliup-auto-queue-national.lock --upload-lock-file /home/maverick/RM/rm-monitor-2026/logs/biliup-upload-global.lock
 Restart=on-failure
 RestartSec=5
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -25,10 +26,11 @@ DEFAULT_TAGS = "RoboMaster,RMUC2026,机器人竞赛,适应性训练"
 DEFAULT_REPOST_SOURCE = "RoboMaster 官方直播"
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_STATE_DIR = Path(__file__).resolve().parents[2] / "logs"
+DEFAULT_UPLOAD_LOCK_FILE = DEFAULT_STATE_DIR / "biliup-upload-global.lock"
 DEFAULT_SEASON_NAME = os.environ.get("RM_MONITOR_ADAPTIVE_BILI_SEASON_NAME", "RMUC2026北部赛区全视角录制")
 DEFAULT_SEASON_ID = int(os.environ.get("RM_MONITOR_ADAPTIVE_BILI_SEASON_ID", "8209772"))
 DEFAULT_SECTION_ID = int(os.environ.get("RM_MONITOR_ADAPTIVE_BILI_SECTION_ID", "9124491"))
-SERVICE = "adaptive-training-upload"
+SERVICE = os.environ.get("RM_MONITOR_SERVICE_NAME", "adaptive-training-upload")
 
 
 @dataclass
@@ -48,6 +50,7 @@ def main() -> int:
     parser.add_argument("--timezone", default=DEFAULT_TIMEZONE)
     parser.add_argument("--target-root", default=DEFAULT_TARGET_ROOT)
     parser.add_argument("--state-file", default="")
+    parser.add_argument("--upload-lock-file", default=str(DEFAULT_UPLOAD_LOCK_FILE))
     parser.add_argument("--cookie", default=DEFAULT_COOKIE)
     parser.add_argument("--biliup", default="biliup")
     parser.add_argument("--bili-submit", default="web", choices=["app", "web", "b-cut-android"])
@@ -110,7 +113,20 @@ def main() -> int:
             return 0
         if eligible:
             group = eligible[0]
-            upload_group(args, state_path, state, group)
+            upload_lock = try_acquire_upload_lock(Path(args.upload_lock_file))
+            if upload_lock is None:
+                local_log.log_event(
+                    SERVICE,
+                    "INFO",
+                    "global Bilibili upload lane is busy; waiting",
+                    hour=group.key,
+                    lock_file=args.upload_lock_file,
+                )
+            else:
+                try:
+                    upload_group(args, state_path, state, group)
+                finally:
+                    release_lock(upload_lock)
         if args.once:
             return 0
         sleep_for(args.poll_seconds)
@@ -149,7 +165,7 @@ def group_is_eligible(args: argparse.Namespace, group: HourGroup, state: dict, t
     record = state.get("uploads", {}).get(group.key, {})
     now = datetime.now(timezone)
     now_ts = time.time()
-    if record.get("status") == "uploaded":
+    if record.get("status") in {"uploaded", "cancelled", "skipped"}:
         return False
     if record.get("status") == "uploading":
         started_at = float(record.get("started_at_ts") or 0)
@@ -196,7 +212,8 @@ def upload_group(args: argparse.Namespace, state_path: Path, state: dict, group:
         is_only_self=args.is_only_self,
     )
     code, output = run_streaming(command)
-    if code != 0:
+    bvid = find_bvid_in_text(output)
+    if code != 0 and not bvid:
         set_state(
             state_path,
             state,
@@ -213,22 +230,42 @@ def upload_group(args: argparse.Namespace, state_path: Path, state: dict, group:
         )
         local_log.log_event(SERVICE, "ERROR", "adaptive training upload failed", hour=group.key, title=title, exit_code=code)
         return
-    bvid = find_bvid_in_text(output)
+
+    # Persist submission identity before any Bilibili post-processing.  A
+    # collection/edit API failure must never cause the large video to be
+    # submitted a second time on the next queue pass.
+    submitted_record = {
+        "status": "uploaded",
+        "attempts": attempts,
+        "updated_at": timestamp(),
+        "updated_at_ts": time.time(),
+        "title": title,
+        "bvid": bvid,
+        "files": [str(path) for path in group.files],
+        "sizes": [path.stat().st_size for path in group.files],
+        "is_only_self": args.is_only_self,
+        "submit_exit_code": code,
+    }
+    set_state(state_path, state, group.key, submitted_record)
+    if code != 0:
+        local_log.log_event(
+            SERVICE,
+            "WARN",
+            "adaptive training submit returned an error after yielding BVID; duplicate retry suppressed",
+            hour=group.key,
+            title=title,
+            bvid=bvid,
+            exit_code=code,
+        )
     postprocess = postprocess_uploaded_bvid(args, bvid) if bvid else {}
     set_state(
         state_path,
         state,
         group.key,
         {
-            "status": "uploaded",
-            "attempts": attempts,
+            **submitted_record,
             "updated_at": timestamp(),
             "updated_at_ts": time.time(),
-            "title": title,
-            "bvid": bvid,
-            "files": [str(path) for path in group.files],
-            "sizes": [path.stat().st_size for path in group.files],
-            "is_only_self": args.is_only_self,
             **postprocess,
         },
     )
@@ -526,6 +563,26 @@ def load_state(path: Path) -> dict:
     data.setdefault("version", 1)
     data.setdefault("uploads", {})
     return data
+
+
+def try_acquire_upload_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock = path.open("a+")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        return None
+    lock.seek(0)
+    lock.truncate()
+    lock.write(f"{SERVICE} {os.getpid()}\n")
+    lock.flush()
+    return lock
+
+
+def release_lock(lock) -> None:
+    fcntl.flock(lock, fcntl.LOCK_UN)
+    lock.close()
 
 
 def set_state(path: Path, state: dict, key: str, record: dict) -> None:

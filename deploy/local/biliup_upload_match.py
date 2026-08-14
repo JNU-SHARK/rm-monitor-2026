@@ -32,11 +32,11 @@ DEFAULT_RECORDS_ROOT = "/mnt/PC801/rm-monitor/records"
 DEFAULT_ARCHIVE_TARGET_ROOT = "/mnt/server_data/rm-monitor/records"
 DEFAULT_CONTINUOUS_CACHE_ROOT = "/mnt/PC801/rm-monitor/records/_continuous_cache"
 DEFAULT_COOKIE = "cookies.json"
-DEFAULT_TITLE_SUFFIX = "RMUC2026区域赛"
+DEFAULT_TITLE_SUFFIX = os.environ.get("RM_MONITOR_TITLE_SUFFIX", "RMUC2026全国赛")
 DEFAULT_TAGS = "RoboMaster,RMUC2026,机器人竞赛"
-DEFAULT_SEASON_NAME = os.environ.get("RM_MONITOR_BILI_SEASON_NAME", "RMUC2026北部赛区全视角录制")
-DEFAULT_SEASON_ID = env_int("RM_MONITOR_BILI_SEASON_ID", "8209772")
-DEFAULT_SECTION_ID = env_int("RM_MONITOR_BILI_SECTION_ID", "9124491")
+DEFAULT_SEASON_NAME = os.environ.get("RM_MONITOR_BILI_SEASON_NAME", "RMUC2026全国赛全视角录制")
+DEFAULT_SEASON_ID = env_int("RM_MONITOR_BILI_SEASON_ID", "8694808")
+DEFAULT_SECTION_ID = env_int("RM_MONITOR_BILI_SECTION_ID", "9688876")
 DEFAULT_COPYRIGHT = "2"
 DEFAULT_REPOST_SOURCE = "RoboMaster 官方直播"
 DEFAULT_BILI_SUBMIT = "web"
@@ -745,7 +745,17 @@ def run_streaming(command: list[str]) -> tuple[int, str]:
 
 
 def is_bili_submit_rate_limited(output: str) -> bool:
-    return "投稿过于频繁" in output or "code: 21566" in output or '"code":21566' in output
+    return any(
+        token in output
+        for token in (
+            "投稿过于频繁",
+            "请求过于频繁",
+            "code: 21566",
+            '"code":21566',
+            "code: -509",
+            '"code":-509',
+        )
+    )
 
 
 def archive_command(args: argparse.Namespace, match_info: MatchInfo, *, delete_source: bool = False, delete_source_only: bool = False) -> list[str]:
@@ -1009,6 +1019,8 @@ def find_bvids_by_title(session: requests.Session, title: str) -> list[str]:
 
 
 def wait_for_new_bvid(session: requests.Session, title: str, before: set[str], fallback_bvid: str = "") -> str:
+    if fallback_bvid and fallback_bvid not in before:
+        return fallback_bvid
     for _ in range(30):
         bvids = find_bvids_by_title(session, title)
         new_bvids = [bvid for bvid in bvids if bvid not in before]

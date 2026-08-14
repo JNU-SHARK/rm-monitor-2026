@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import re
 import subprocess
 import time
@@ -20,8 +21,8 @@ DEFAULT_LOCAL_LOG_DIR = DEFAULT_REPO_ROOT / "logs"
 SCHEDULE_URL = "https://pro-robomasters-hz-n5i3.oss-cn-hangzhou.aliyuncs.com/live_json/schedule.json"
 LIVE_INFO_URL = "https://rm-static.djicdn.com/live_json/live_game_info.json"
 OFFICIAL_BACKUP_CACHE_SERVICE = "rm-monitor-official-backup-cache.service"
-OFFICIAL_BACKUP_CACHE_EVENT = "RMUC 2026超级对抗赛"
-OFFICIAL_BACKUP_CACHE_ZONE = "东部赛区"
+OFFICIAL_BACKUP_CACHE_EVENT = os.environ.get("RM_MONITOR_EVENT_NAME", "RMUC 2026超级对抗赛")
+OFFICIAL_BACKUP_CACHE_ZONE = os.environ.get("RM_MONITOR_ZONE", "全国赛")
 OFFICIAL_BACKUP_CACHE_SESSION = "正赛备用缓存"
 OFFICIAL_BACKUP_CACHE_SOURCE_ROOT = Path("/mnt/PC801/rm-monitor/official-backup-cache")
 OFFICIAL_BACKUP_CACHE_TARGET_ROOT = Path("/mnt/server_data/rm-monitor/records")
@@ -38,12 +39,20 @@ LOG_TARGETS = [
     ("transcode-job", "job-prefix/transcode-"),
     ("postgres", "deployment/postgres"),
     ("redis", "deployment/redis"),
+    ("local-biliup-auto-national", "local-log/biliup-auto-queue"),
+    ("local-biliup-auto-revival", "local-log/biliup-auto-queue-revival"),
     ("local-biliup", "local-log/biliup-upload"),
-    ("local-archive-auto", "local-log/archive-auto-queue"),
+    ("local-archive-auto-national", "local-log/archive-auto-queue"),
+    ("local-archive-auto-revival", "local-log/archive-auto-queue-revival"),
     ("local-archive", "local-log/archive-artifacts"),
     ("local-emergency-record", "local-log/emergency-record"),
     ("local-continuous-cache", "local-log/continuous-cache"),
     ("local-backup-cache", "local-log/official-backup-cache"),
+    ("local-backup-cache-revival", "local-log/official-backup-cache-revival"),
+    ("local-training-recorder-national", "local-log/adaptive-training-recorder-national"),
+    ("local-training-recorder-revival", "local-log/adaptive-training-recorder-revival"),
+    ("local-training-upload-national", "local-log/adaptive-training-upload-national"),
+    ("local-training-upload-revival", "local-log/adaptive-training-upload-revival"),
     ("local-dns-guard", "local-log/cluster-dns-guard"),
     ("biliup-download.log", "local-file/download.log"),
     ("biliup-ds_update.log", "local-file/ds_update.log"),
@@ -1911,13 +1920,18 @@ def is_benign_log_item(item: dict) -> bool:
     if fields:
         return is_benign_json_event(fields)
     raw = str(item.get("raw") or "").lower()
-    return "script interrupted" in raw or "exit_code=130" in raw or '"exit_code": 130' in raw
+    return (
+        "script interrupted" in raw
+        or "stop requested" in raw
+        or "exit_code=130" in raw
+        or '"exit_code": 130' in raw
+    )
 
 
 def is_benign_json_event(fields: dict) -> bool:
     msg = str(fields.get("msg") or fields.get("message") or "").lower()
     exit_code = str(fields.get("exit_code") or "")
-    return exit_code == "130" or "script interrupted" in msg
+    return exit_code == "130" or "script interrupted" in msg or "stop requested" in msg
 
 
 def local_event_keys(fields: dict, path: Path) -> list[str]:

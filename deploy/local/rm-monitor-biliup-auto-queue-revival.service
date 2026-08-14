@@ -1,0 +1,21 @@
+[Unit]
+Description=RM Monitor revival Bilibili auto queue
+Wants=network-online.target docker.service
+After=network-online.target docker.service
+
+[Service]
+Type=simple
+User=maverick
+Group=maverick
+WorkingDirectory=/home/maverick/RM/rm-monitor-2026
+Environment=HOME=/home/maverick
+Environment=KUBECONFIG=/home/maverick/.kube/config
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=RM_MONITOR_SERVICE_NAME=biliup-auto-queue-revival
+EnvironmentFile=/home/maverick/RM/rm-monitor-2026/deploy/local/rm-monitor-event.conf
+ExecStart=/usr/bin/python3 deploy/local/biliup_auto_queue.py --zone ${RM_MONITOR_REVIVAL_ZONE} --start-order 1 --limit 7 --title-suffix ${RM_MONITOR_REVIVAL_TITLE_SUFFIX} --season-name ${RM_MONITOR_REVIVAL_BILI_SEASON_NAME} --season-id ${RM_MONITOR_REVIVAL_BILI_SEASON_ID} --section-id ${RM_MONITOR_REVIVAL_BILI_SECTION_ID} --biliup deploy/local/biliup_direct_docker.sh --cookie /home/maverick/RM/rm-monitor-2026/cookies.json --poll-seconds 60 --lock-file /home/maverick/RM/rm-monitor-2026/logs/biliup-auto-queue-revival.lock --upload-lock-file /home/maverick/RM/rm-monitor-2026/logs/biliup-upload-global.lock
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import time
 import urllib.request
@@ -11,7 +12,8 @@ import local_log
 
 
 DEFAULT_LIVE_INFO_URL = "https://rm-static.djicdn.com/live_json/live_game_info.json"
-DEFAULT_EVENT = "RMUC 2026超级对抗赛"
+DEFAULT_EVENT = os.environ.get("RM_MONITOR_EVENT_NAME", "RMUC 2026超级对抗赛")
+DEFAULT_ZONE = os.environ.get("RM_MONITOR_ZONE", "全国赛")
 DEFAULT_NAMESPACE = "rm-monitor"
 DEFAULT_IMAGE = "rm-monitor/record-job:latest"
 DEFAULT_PVC = "rm-monitor-records"
@@ -20,7 +22,7 @@ DEFAULT_MOUNT = "/records"
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Start redundant zone-level continuous cache jobs.")
-    parser.add_argument("--zone", default="南部赛区")
+    parser.add_argument("--zone", default=DEFAULT_ZONE)
     parser.add_argument("--event", default=DEFAULT_EVENT)
     parser.add_argument("--date", default=time.strftime("%Y-%m-%d"))
     parser.add_argument("--res", default="high", choices=("high", "middle", "low"))
